@@ -31,10 +31,19 @@ if (is_array($in) && isset($in['ai_output'])) {
     $text = isset($_POST['ai_output']) ? (string)$_POST['ai_output'] : '';
 }
 
-if ($text === '') {
-    echo json_encode(['error' => 'Empty ai_output']); exit;
+// accept API-level tool calls
+$toolCalls = [];
+if (is_array($in ?? null)) {
+    if (isset($in['tool_calls']) && is_array($in['tool_calls'])) {
+        $toolCalls = $in['tool_calls'];
+    } elseif (isset($in['assistant']['tool_calls']) && is_array($in['assistant']['tool_calls'])) {
+        $toolCalls = $in['assistant']['tool_calls'];
+    }
 }
 
+if ($text === '' && !$toolCalls) {
+    echo json_encode(['error' => 'Empty ai_output']); exit;
+}
 
 
 function normalize_json_like(string $s): string {
@@ -169,14 +178,62 @@ function handle_memory(array $json, MemoryStore $mem): array {
     return ['tag'=>'memory','error'=>'bad_request'];
 }
 
+/* ======== processor ======= */
+
+$taskStore   = new TaskStore('/var/lib/euno/memory/tasks.json');
+$memoryStore = new MemoryStore('/var/lib/euno/memory/global.json');
+$out = ['handled'=>[], 'unhandled'=>[], 'tool_messages'=>[]];
+
+// API-level function calls
+if ($toolCalls) {
+    foreach ($toolCalls as $tc) {
+        $id   = (string)($tc['id'] ?? '');
+        $type = strtolower((string)($tc['type'] ?? ''));
+        $fn   = (string)($tc['function']['name'] ?? '');
+        $argsRaw = (string)($tc['function']['arguments'] ?? '{}');
+
+        if ($type !== 'function' || $fn === '') {
+            $out['unhandled'][] = ['tag'=>'tool_call','error'=>'bad_tool_call'];
+            continue;
+        }
+
+        $json = json_decode($argsRaw, true);
+        if (!is_array($json)) $json = json_decode(normalize_json_like($argsRaw), true);
+        if (!is_array($json)) {
+            $out['unhandled'][] = ['tag'=>$fn,'error'=>'invalid_json','tool_call_id'=>$id];
+            continue;
+        }
+
+        $res = null;
+        switch (strtolower($fn)) {
+            case 'action':   $res = handle_action($json, $taskStore);   break;
+            case 'memory':   $res = handle_memory($json, $memoryStore); break;
+            case 'interest': $res = ['tag'=>'interest','payload'=>$json,'status'=>'for_server_execute']; break;
+            case 'debug':    $res = ['tag'=>'debug','payload'=>$json['op']??null,'status'=>'for_server_execute']; break;
+            default:         $res = ['tag'=>$fn,'status'=>'reserved'];  break;
+        }
+
+        $out['handled'][] = $res;
+
+        // ready-to-send tool message back to the model
+        $out['tool_messages'][] = [
+            'role'         => 'tool',
+            'tool_call_id' => $id,
+            'content'      => json_encode($res, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)
+        ];
+    }
+
+    // If invoked solely for tool calls, short-circuit with result
+    if ($text === '') {
+        echo json_encode($out, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
+        exit;
+    }
+}
 
 // Extract fenced blocks: ~~~<tag>\n{json}\n~~~
 $matches = [];
 preg_match_all('/~~~(\w+)\s*({[\s\S]*?})\s*~~~/u', $text, $matches, PREG_SET_ORDER);
 
-$taskStore   = new TaskStore('/var/lib/euno/memory/tasks.json');
-$memoryStore = new MemoryStore('/var/lib/euno/memory/global.json');
-$out = ['handled'=>[], 'unhandled'=>[]];
 
 if (!$matches) {
     echo json_encode($out, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
@@ -215,87 +272,3 @@ foreach ($matches as $m) {
 }
 
 echo json_encode($out, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
-
-
-
-
-/*
-foreach ($matches as $m) {
-    $tag = strtolower($m[1] ?? '');
-    $raw = (string)($m[2] ?? '');
-    $json = json_decode($raw, true);
-    if (!is_array($json)) {
-        $json = json_decode(normalize_json_like($raw), true);
-    }
-    if (!is_array($json)) { $out['unhandled'][] = ['tag'=>$tag,'error'=>'invalid_json']; continue; }
-
-    // ----- ACTION (tasks) -----
-    if ($tag === 'action') {
-        $intent = strtolower((string)($json['intent'] ?? ''));
-        $args   = $json['args'] ?? [];
-        switch ($intent) {
-            case 'fetch_task': {
-                $name = trim((string)($args['name'] ?? ''));
-                $date = isset($args['date']) ? trim((string)$args['date']) : null;
-                if ($name === '') { $out['handled'][] = ['intent'=>$intent,'error'=>'missing_name']; break; }
-                $task = $taskStore->findByName($name, $date);
-                $out['handled'][] = ['intent'=>$intent, 'result'=>$task, 'note'=>$task?null:'not_found'];
-                break;
-            }
-            case 'fetch_tasks_by_window': {
-                $start = new DateTimeImmutable((string)($args['start_iso'] ?? 'today'));
-                $end   = new DateTimeImmutable((string)($args['end_iso'] ?? 'today +7 days'));
-                $res = [];
-                foreach ($taskStore->listAll() as $t) {
-                    $d = $t['time']['date'] ?? null; if (!$d) continue;
-                    $dt = new DateTimeImmutable($d);
-                    if ($dt >= $start && $dt <= $end) $res[] = $t;
-                }
-                $out['handled'][] = ['intent'=>$intent, 'result'=>$res];
-                break;
-            }
-            case 'update_task':
-            case 'create_task':
-            case 'delete_task':
-                $out['handled'][] = ['intent'=>$intent, 'status'=>'not_implemented'];
-                break;
-            default:
-                $out['unhandled'][] = ['tag'=>$tag,'intent'=>$intent,'error'=>'unknown_intent'];
-        }
-        continue;
-    }
-
-    // ----- MEMORY (global) -----
-    if ($tag === 'memory') {
-        $op = strtolower((string)($json['op'] ?? ''));
-        $fact = trim((string)($json['fact'] ?? ''));
-        if ($op === 'upsert' && $fact) {
-            try {
-                $memoryStore->remember($fact);
-            } catch (Throwable $e) {
-                http_response_code(500);
-                error_log('memory-store error: '.$e->getMessage());
-                echo json_encode(['error'=>'memory_store_error']); exit;
-            }
-            $out['handled'][] = ['tag'=>'memory','status'=>'remembered','fact'=>$fact];
-        } elseif ($op === 'delete' && $fact) {
-            try {
-                $memoryStore->forget($fact);
-            } catch (Throwable $e) {
-                http_response_code(500);
-                error_log('memory-store error: '.$e->getMessage());
-                echo json_encode(['error'=>'memory_store_error']); exit;
-            }
-            $out['handled'][] = ['tag'=>'memory','status'=>'forgot','fact'=>$fact];
-        } else {
-            $out['unhandled'][] = ['tag'=>'memory','error'=>'bad_request'];
-        }
-        continue;
-    }
-
-    // Unknown tag (reserved for future)
-    $out['unhandled'][] = ['tag'=>$tag,'status'=>'reserved'];
-}
-
-echo json_encode($out, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
-*/

@@ -24,8 +24,13 @@ if (is_file($sysPath) && is_readable($sysPath)) {
     if (is_string($ret)) { $SYSTEM_PROMPT = $ret; }
 }
 
-require '/var/lib/euno/sql/db.php';
+require_once '/var/lib/euno/sql/db.php';
 ensure_session(); // from db.php
+
+require '/var/lib/euno/graph-memory/GraphMemoryBridge.php';
+
+require_once '/var/lib/euno/lib/create-context.php';
+
 
 // require_once __DIR__ . '/../vendor/autoload.php';
 
@@ -36,29 +41,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
 
   header('Content-Type: application/json; charset=utf-8');
 
-  // parse input
+  // Parse input
   $in = json_decode(file_get_contents('php://input'), true);
   $client_messages = $in['messages'] ?? null;
   if (!is_array($client_messages) || !$client_messages) {
       echo json_encode(['error' => 'Empty messages']); exit;
   }
 
-  // session (cookie-backed)
+  // Session (cookie-backed)
   $sid = ensure_session();
+  
+  // Load context using the function in create-context.php
+  $context = create_context($sid, $client_messages);
+  $outgoing = $context['messages'];
 
-  $system_stack = [];
-  // euno persona
-  if ($SYSTEM_PROMPT !== '') {
-      $system_stack[] = ['role' => 'system', 'content' => $SYSTEM_PROMPT];
-  }
-  // task + memories
-  $system_stack = array_merge($system_stack, extract_system_from_client($client_messages));
-  // DB history + client delta
-  $outgoing = pack_messages_for_model($sid, $system_stack, 8192, 1024);
-  $client_delta = build_client_delta($client_messages);
-  if (!empty($client_delta)) {
-      $outgoing = array_merge($outgoing, $client_delta);
-  }
+  $last_tool_call = $in['last_func_call'] ?? null;
+  if ($last_tool_call) preserve_tool_call($outgoing, $last_tool_call);
+
+  $__skip_user_contents = $context['skip_user_contents'];
+  $__pre_user_id = $context['pre_user_id'];
+  $__detector = $context['detector'];
+  
+  // error_log('outgoing='.json_encode($outgoing, JSON_UNESCAPED_UNICODE));
+
+  // --- debug tap: pre-call (readable) ---
+  
+  $rid = bin2hex(random_bytes(8));              // request id
+  $DBG_PREVIEW_CHARS = 150;                     // small, readable cap
+  $roleCounts = array_count_values(array_map(fn($m)=>$m['role'], $outgoing));
+  $preview = array_map(function($m) use ($DBG_PREVIEW_CHARS){
+    $c = (string)($m['content'] ?? '');
+    if ($m['role'] === 'tool') {error_log(json_encode($m, JSON_PRETTY_PRINT));}
+    $logged = [
+      'r'   => $m['role'],
+      'len' => mb_strlen($c),
+      'text'=> mb_substr($c, 0, $DBG_PREVIEW_CHARS)  // <-- readable content
+    ];
+    if (array_key_exists('tool_call_id', $m)) {
+      $logged['tool_call_id'] = $m['tool_call_id'];
+    };
+    return $logged;
+  }, $outgoing);
+
+  // error_log(prettyTrimmedJson($outgoing, 150), 3, '/var/log/euno/last-input.json');
+  file_put_contents('/var/log/euno/last-input.json', prettyTrimmedJson($outgoing, 150), LOCK_EX);
+
+  header('X-Euno-Req: '.$rid);
+  
+
 
   // ------- API -------
   $apiKey = load_key();
@@ -67,7 +97,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
       echo json_encode(['error' => $resp['error']]); exit;
   }
 
-  $answer_raw = extract_text($resp['data']);  // may contain fences
+  // handling api tool call
+  $choice   = $resp['data']['choices'][0] ?? [];
+  $message  = $choice['message'] ?? [];
+  $toolCalls= is_array($message['tool_calls'] ?? null) ? $message['tool_calls'] : [];
+
+  $answer_raw = isset($message['content']) ? sanitize_punct((string)$message['content']) : '';  // may contain fences
+  // --- debug tap: post-call (readable) ---
+  /*
+  error_log(json_encode([
+    't'=>'post','rid'=>$rid,'sid'=>$sid,
+    'answer_len'=>mb_strlen($answer_raw)
+    'answer'=>mb_substr($answer_raw, 0, $DBG_PREVIEW_CHARS)   // <-- readable content
+  ], JSON_UNESCAPED_UNICODE)."\n", 3, '/var/log/euno/chat.jsonl');
+  */
+
+
 
   // ------- persist history (append-only, idempotent) -------
   try {
@@ -81,7 +126,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
 
           // marker injected by frontend after routing
           //   history.push({ role:'system', content:'tool:router_result ' + JSON.stringify(router) });
-          if ($role === 'system' && strncmp($content, 'tool:router_result ', 19) === 0) {
+          if ($role === 'system' && strncmp($content, 'router result: ', 15) === 0) {
               // keep the system trace; comment next line if not desired
               insert_message($sid, 'system', $content);
               $skip_next_user_once = true;     // next user line is ephemeral nudge
@@ -90,73 +135,112 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
 
           // ephemeral router-nudged user input: do NOT persist
           if ($role === 'user' && $skip_next_user_once) {
-              $skip_next_user_once = false;
-              continue;
+            if (stripos($content, 'continue') !== 0) {
+              insert_message($sid, 'user', $content); // compatible if nudge no longer needed
+            }
+            $skip_next_user_once = true;     // next user line is ephemeral nudge
+            continue;
+          }
+
+          // GM: do not skip current-turn user; rely on INSERT IGNORE to dedupe
+          if ($role === 'user' && isset($__skip_user_contents) && is_array($__skip_user_contents)) {
+              $idx = array_search($content, $__skip_user_contents, true);
+              if ($idx !== false) {
+                  array_splice($__skip_user_contents, $idx, 1);
+                  if (!$__skip_user_contents) unset($__skip_user_contents);
+                  // fall through to insert
+              }
+          }
+
+          // keep tool info
+          if ($role === 'tool') {
+            if (!isset($m['tool_call_id'])) { continue; }
+            insert_message($sid, 'tool', $content, 0, null, null, null, null, $m['tool_call_id']);
+            continue;
           }
 
           // normal persistence (system/user/tool only)
           if ($role !== 'assistant') {
+              $lc = strtolower($content);
+              // skip ephemerals: task/memories/time system lines
+              if ($role === 'system' && (
+                  strpos($lc, 'task-context:') === 0 ||
+                  strpos($lc, '```task context policy:') === 0 ||
+                  strpos($lc, 'memories:') === 0 ||
+                  strpos($lc, 'current time is:') === 0 ||
+                  strncmp($content, '[Memory', 11) === 0 ||
+                  preg_match('/^(\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2})/i', $content)
+              )) {
+                  continue;
+              }
               insert_message($sid, $role, $content);
           }
       }
 
       // assistant reply (RAW)
-      if ($answer_raw !== '') {
-          insert_message($sid, 'assistant', $answer_raw, 0, OPENAI_MODEL, null, null);
+      $assistant_msg_id = null;
+      $toolCalls = is_array($message['tool_calls'] ?? null) ? $message['tool_calls'] : [];
+      $toolCallsJson = $toolCalls ? json_encode($toolCalls, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) : null;
+      if ($answer_raw !== '' || $toolCallsJson) {
+          $tool_calls_json = $toolCalls ? json_encode($toolCalls, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) : null;
+          $assistant_msg_id = insert_message_id($sid, 'assistant', $answer_raw, 0, OPENAI_MODEL, null, null, $tool_calls_json, null);
       }
+      GraphMemoryBridge::logTurn($sid, $__pre_user_id ?? null, $assistant_msg_id, $__detector ?? []);
+
+      if ($assistant_msg_id && ($answer_raw !== '' || $toolCallsJson)) {
+            GraphMemoryBridge::processAssistantMemory($sid, $assistant_msg_id, $answer_raw);
+        }
   } catch (Throwable $e) {
       error_log('[history] persist failed: '.$e->getMessage());
   }
 
-  echo json_encode(['answer' => $answer_raw], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+  echo json_encode([
+    'answer'               => (string)($message['content'] ?? ''),
+    'assistant_tool_calls' => $toolCalls
+  ], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+
+  try { // summary mechanism
+    if (need_summary($sid)) {
+      // adapter: reuse your call_openai but with custom limits
+      $sumCall = function(array $messages, int $maxTokens, float $temp) use ($apiKey) : ?string {
+        // clone your call_openai but override tokens/temp
+        $payload = [
+          'model'      => OPENAI_MODEL,
+          'messages'   => $messages,
+          'max_tokens' => $maxTokens,
+          'temperature'=> $temp,
+        ];
+        $ch = curl_init(OPENAI_API_URL);
+        curl_setopt_array($ch, [
+          CURLOPT_RETURNTRANSFER => true,
+          CURLOPT_POST           => true,
+          CURLOPT_HTTPHEADER     => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $apiKey,
+          ],
+          CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+          CURLOPT_TIMEOUT        => 25,
+        ]);
+        $raw = curl_exec($ch);
+        curl_close($ch);
+        $json = json_decode((string)$raw, true);
+        if (!is_array($json)) return null;
+        $msg = $json['choices'][0]['message']['content'] ?? '';
+        return is_string($msg) && $msg !== '' ? $msg : null;
+      };
+
+      create_session_summary($sid, function(array $m, int $k, float $t) use ($sumCall) {
+        return $sumCall($m, $k, $t);
+      });
+    }
+  } catch (Throwable $e) {
+    error_log('[summary] failed: '.$e->getMessage());
+  }
+
+
   exit;
 }
 
-
-function extract_system_from_client(array $msgs): array {
-    $out = [];
-    $seen_task = false; $seen_mem = false; $seen_date = false;
-
-    foreach ($msgs as $m) {
-        if (($m['role'] ?? '') !== 'system') continue;
-        $c = (string)($m['content'] ?? '');
-
-        // keep first "task-context: ..."
-        if (!$seen_task && stripos($c, '```Task context policy:') === 0) {
-            $out[] = ['role' => 'system', 'content' => $c];
-            $seen_task = true; 
-            continue;
-        }
-        // keep first "memories: ..."
-        if (!$seen_mem && stripos($c, 'memories:') === 0) {
-            $out[] = ['role' => 'system', 'content' => $c];
-            $seen_mem = true; 
-            continue;
-        }
-        // keep one timestamp line (the date the client injected)
-        // relaxed check: starts with digits and has separators
-        if (!$seen_date && preg_match('/^\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2}/', $c)) {
-            $out[] = ['role' => 'system', 'content' => $c];
-            $seen_date = true;
-            continue;
-        }
-    }
-    return $out;    // order preserved as they appeared in client payload
-}
-
-function build_client_delta(array $msgs): array {
-    $delta = [];
-    foreach ($msgs as $m) {
-        $role = $m['role'] ?? '';
-        if ($role === 'assistant') continue;
-        $c = (string)($m['content'] ?? '');
-        if (stripos($c, '```Task context policy:') === 0) continue;
-        if (stripos($c, 'memories:')    === 0) continue;
-        if (preg_match('/^\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2}/', $c)) continue;
-        $delta[] = ['role'=>$role, 'content'=>$c];
-    }
-    return $delta; // order preserved; may include consecutive same-role messages
-}
 
 /* ---------- helpers ---------- */
 function load_key(): string {
@@ -177,12 +261,16 @@ function call_openai(array $messages, string $apiKey): array {
         'reasoning' => [ 'effort' => 'low' ], // adapted 202508
     ];
     // ds
+    $TOOLS = require '/var/lib/euno/memory/tool-functions.php';
     $payload = [
         'model'      => 'deepseek-chat',        
         'messages'   => $messages,          
         'max_tokens' => 2048,
-        'temperature'=> 0.85,                
+        'tools'      => $TOOLS,
+        'temperature'=> 1.3,                
         // 'stream'   => true,               // optional: if streaming will be added later
+        'frequency_penalty' => 0.7,
+        'presence_penalty' => 0.5,  
     ];
     $ch = curl_init(OPENAI_API_URL);
     curl_setopt_array($ch, [
@@ -193,7 +281,7 @@ function call_openai(array $messages, string $apiKey): array {
             'Authorization: Bearer ' . $apiKey,
         ],
         CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
-        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_TIMEOUT        => 25,
     ]);
     $raw  = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -231,7 +319,7 @@ function extract_text(array $resp): string {
   $msg = $resp['choices'][0]['message'] ?? [];
   if (!empty($msg['content'])) {
     //error_log('[deepseek] msg=' . $msg['content']);
-    return (string)$msg['content'];
+    return sanitize_punct($msg['content']);
   }
   if (!empty($msg['reasoning_content'])) return (string)$msg['reasoning_content'];
 
@@ -242,11 +330,29 @@ function extract_text(array $resp): string {
 // forbid —, –, and -- in final output.
 function sanitize_punct(string $s): string {
     // Replace any em/en dash or double hyphen (with surrounding spaces) by a comma+space
-    $s = preg_replace('/\h*(?:—|–|--)\h*/u', ', ', $s);
+    $s = preg_replace('/\h*(?:—|–|--|-)\h*/u', ', ', $s);
     // Collapse duplicate commas/spaces
     $s = preg_replace('/\s*,\s*,+/', ', ', $s);
     $s = preg_replace('/\s{2,}/', ' ', $s);
     return trim($s);
+}
+
+function preserve_tool_call(array &$messages, array $tool_calls): void {
+  $l = count($messages);
+  $last_msg = $messages[$l - 1];
+  if ($last_msg['role'] !== 'tool') return;
+  
+  $sec_last_msg = $messages[$l - 2];
+  if ($sec_last_msg['role'] !== 'assistant') {
+    error_log('[index] preserve_tool_call expected assitant but not');
+    error_log(json_encode($sec_last_msg));
+    return;
+  }
+
+  $sec_last_msg['tool_calls'] = $tool_calls;
+  $messages[$l - 2] = $sec_last_msg;
+
+  // error_log(json_encode($messages[$l - 2]));
 }
 
 // Load system prompt content for embedding into the page
@@ -483,10 +589,8 @@ const IS_LIKELY_IOS = /iP(hone|ad|od)/i.test(navigator.userAgent) ||
                       (/Mac/i.test(navigator.userAgent) && 'ontouchend' in document);
 const IS_TOUCH = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 
-
-// in-page history only (server adds hidden system persona)
+// in-page history only
 const history = [];
-let injectedContext = false;
 let inFlight = false;
 
 // user msg buffering
@@ -496,20 +600,22 @@ let pendingTick = null;
 let pendingETA = 0; 
 let queuedCount = 0;
 let lastTurnQueuedCount = 0;
-let isComposing = false;  // IME (Chinese/Japanese/etc.) composition state
+let isComposing = false;
 let isKeyboardOpen = false;
 let _kbPrev = false;
 
-let typingTimer = null;       // fires when user stops typing
-let typingIdleMs = 6000;      
-let typingInitMs = 1800;      
-let typingETA = 0;            // for status/debug
+let typingTimer = null;
+let typingIdleMs = 6000;
+let typingInitMs = 1800;
+let typingETA = 0;
+
+let lineInterval = 1601;
 
 pendingEl.classList.add('on'); 
 updatePendingText();
-setInterval(updatePendingText, 500); // heartbeat while idle
+setInterval(updatePendingText, 500);
 
-function rearmTypingGrace(){                       // start/refresh grace without sending
+function rearmTypingGrace(){
   if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
   clearPending();
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
@@ -522,21 +628,19 @@ function rearmTypingGrace(){                       // start/refresh grace withou
   updatePendingText();
 }
 
-function imeOpen(){                         // predicate for “IME/keyboard is open”
-  if (isComposing) return true;             // IME composing = open
+function imeOpen(){
+  if (isComposing) return true;
   const focused = document.activeElement === box;
-  if (!focused) return false;               // only care when the textarea is focused
+  if (!focused) return false;
 
   const vv = window.visualViewport;
   if (vv){
     const occluded = window.innerHeight - (vv.height + vv.offsetTop);
-    if (occluded > KB_EPS) return true;     // visual occlusion says keyboard is up
+    if (occluded > KB_EPS) return true;
   }
 
-  // Fallback: on iOS Safari, focus ≈ keyboard shown even if occlusion is 0
-  return IS_LIKELY_IOS && focused;          // keeps PC behavior unchanged
+  return IS_LIKELY_IOS && focused;
 }
-
 
 (function(){
   const root = document.documentElement;
@@ -550,8 +654,6 @@ function imeOpen(){                         // predicate for “IME/keyboard is 
 
   function setAppHeight(){
     const wasAtBottom = Math.abs(chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 2;
-    
-    // store current scroll position before any changes
     const prevScrollTop = chat.scrollTop;
     
     const vh   = vv ? vv.height : window.innerHeight;
@@ -563,11 +665,9 @@ function imeOpen(){                         // predicate for “IME/keyboard is 
     const wasKbOpen = root.classList.contains('ime-open');
     root.classList.toggle('ime-open', kbOpen);
     
-    // only handle keyboard toggle on state change
     if (kbOpen !== wasKbOpen) {
       handleKeyboardToggle(kbOpen);
       
-      // restore scroll position if keyboard just opened
       if (kbOpen && !wasKbOpen) {
         requestAnimationFrame(() => {
           chat.scrollTop = prevScrollTop;
@@ -575,7 +675,6 @@ function imeOpen(){                         // predicate for “IME/keyboard is 
       }
     }
 
-    // only auto-scroll to bottom if user was already there AND not during keyboard open
     if (!kbOpen && wasAtBottom) {
       chat.scrollTop = chat.scrollHeight;
     }
@@ -583,20 +682,17 @@ function imeOpen(){                         // predicate for “IME/keyboard is 
 
   setAppHeight();
   vv?.addEventListener('resize', setAppHeight);
-  // vv?.addEventListener('scroll', setAppHeight);
-  // geometrychange isn’t everywhere; safe no-op if missing
-  vv?.addEventListener?.('geometrychange', setAppHeight); // [NEW]
+  vv?.addEventListener?.('geometrychange', setAppHeight);
   window.addEventListener('orientationchange', setAppHeight);
 })();
 
-
-/* ---------- UI ---------- */
 function debugOn(){ return document.documentElement.getAttribute('data-debug') !== 'off'; }
 function sys(msg){ if (debugOn()) addBubble('sys', msg); }
 
 function addBubble(role, text){
   const div = document.createElement('div');
   div.className = 'msg ' + (role==='user' ? 'user' : role==='assistant' ? 'assistant' : 'sys');
+  if (role === 'assistant') {text = renderVisible(text);}
   div.textContent = text;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
@@ -609,13 +705,16 @@ function showPending(ms){
   pendingEl.classList.add('on');
   updatePendingText();
 }
+
 function clearPending(){
   pendingETA = 0;
   if (pendingTick) { clearInterval(pendingTick); pendingTick = null; }
   pendingTextEl.textContent = 'Idle';
   updatePendingText();
 }
+
 function esc(s){return String(s).replace(/[&<>"']/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]))}
+
 function setVars(obj){
   const el = document.getElementById('pendingVars');
   if (document.documentElement.getAttribute('data-debug') === 'off'){ el.innerHTML=''; return; }
@@ -639,31 +738,17 @@ function updatePendingText(){
                     ? (box.value.trim() ? 'typing grace' : 'focus grace')
                     : 'typing grace');
     pendingTextEl.textContent = `${mode} ${(tleft/1000).toFixed(1)}s`;
-  } else if (isComposing) {                  // [MOD] kept for clarity; also covered by imeOpen()
+  } else if (isComposing) {
     pendingTextEl.textContent = 'IME composing';
-  } else if (imeOpen()) {                    // [MOD] use unified predicate (was: isKeyboardOpen flag)
+  } else if (imeOpen()) {
     pendingTextEl.textContent = 'Idle (keyboard open)';
   } else {
     const suffix = (tailRole() === 'assistant') ? ' (awaiting user)' : '';
     pendingTextEl.textContent = 'Idle' + suffix;
   }
 
-
   const varsEl = document.getElementById('pendingVars');
   if (document.documentElement.getAttribute('data-debug') !== 'off') {
-    /*varsEl.textContent =
-      `touch=${IS_TOUCH}\n` +
-      `pendingTimer=${!!pendingTimer}\n` +
-      //`pendingTick=${!!pendingTick}\n` +
-      //`pendingETA=${pendingETA}\n` +
-      //`queuedCount=${queuedCount}\n` +
-      `lastTurnQueuedCount=${lastTurnQueuedCount}\n` +
-      `inFlight=${inFlight}\n` +
-      `tailRole=${tailRole()}\n` +
-      `typingTimer=${!!typingTimer}\n` +
-      `isComposing=${isComposing}\n` + 
-      `isKeyboardOpen=${isKeyboardOpen}\n`;
-      //`typingETA=${typingETA}`;*/
       setVars({
         pendingTimer: !!pendingTimer,
         lastTurnQueuedCount,
@@ -674,48 +759,10 @@ function updatePendingText(){
         isComposing,
         isKeyboardOpen,
       });
-
   } else {
     varsEl.textContent = '';
   }
 }
-
-/* ---------- boot: context + memories ---------- */
-async function ensureTaskContextOnce(){
-  if (injectedContext) return;
-  try{
-    const r = await fetch('tasks-context.php', { cache: 'no-store' });
-    if (!r.ok) throw new Error('http '+r.status);
-    const j = await r.json();
-    const ctx = (j && j.context) ? String(j.context) : '';
-    history.unshift({ role: 'system', content: ctx || 'task-context: empty' });
-    const now = new Date();
-    history.unshift({ role: 'system', content: now.toLocaleString() });
-    injectedContext = true;
-    addBubble('sys', 'Loaded task context for this session');
-  }catch(e){
-    injectedContext = true;
-    history.unshift({ role: 'system', content: 'task-context: unavailable' });
-    addBubble('sys', 'Task context unavailable');
-  }
-}
-ensureTaskContextOnce();
-
-async function injectMemoriesOnce(){
-  if (history.some(h => h.role === 'system' && h.content.startsWith('memories:'))) return;
-  try {
-    const r = await fetch('memories.php', { cache: 'no-store' });
-    if (!r.ok) return;
-    const j = await r.json();
-    if (Array.isArray(j.entries) && j.entries.length) {
-      history.unshift({ role: 'system', content: 'memories: ' + j.entries.join(' | ') });
-      addBubble('sys', 'Loaded Euno\'s memory');
-    }
-  } catch(_){
-    addBubble('sys', 'Euno is in amnesia');
-  }
-}
-injectMemoriesOnce();
 
 /* ---------- fences: parse, render, route, interest ---------- */
 function parseFencedBlocks(s){
@@ -725,28 +772,40 @@ function parseFencedBlocks(s){
   }
   return out;
 }
-function stripFences(s){
-  return String(s||'').replace(/~~~\w+\s*\{[\s\S]*?\}\s*~~~/g,'').trim();
+
+function stripFences(s) {
+  s = String(s || '').replace(/~~~\w+\s*\{[\s\S]*?\}\s*~~~/g, '').trim();
+  // s = s.replace(/\n{2,}/g, '\n');
+  return s;
 }
+
 function renderVisible(s){
+  s = s.replace(/\s*(?:—|–|--|-)\s*/g, ', ');
   return String(s||'')
     .replace(/~~~action[\s\S]*?~~~\s*/g,'[ACT]')
     .replace(/~~~memory[\s\S]*?~~~\s*/g,'[MEM]')
     .replace(/~~~interest[\s\S]*?~~~\s*/g,'[INT]')
     .trim();
 }
-async function routeBlocks(aiOutput){
-  const hasFences=/~~~\w+[\s\S]*?~~~/m.test(aiOutput);
-  if(!hasFences) return null;
-  const r=await fetch('action_router.php',{
+
+async function routeBlocks(aiOutput, toolCalls){
+  const hasFences = /~~~\w+[\s\S]*?~~~/m.test(aiOutput);
+  const hasTools  = Array.isArray(toolCalls) && toolCalls.length>0;
+  if(!hasFences && !hasTools) return null;
+
+  const r = await fetch('action_router.php',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ai_output:aiOutput}),
+    body: JSON.stringify({
+      ai_output: String(aiOutput||''),
+      tool_calls: hasTools ? toolCalls : undefined
+    }),
     credentials:'same-origin'
   });
   if(!r.ok) throw new Error('router http '+r.status);
-  return await r.json(); // {handled,unhandled}
+  return await r.json();
 }
+
 function extractInterest(aiOutput){
   const blocks=parseFencedBlocks(aiOutput);
   let j=(blocks.find(b=>b.tag==='interest')||{}).json||null;
@@ -764,20 +823,16 @@ function extractInterest(aiOutput){
     confidence
   };
 }
-/* ---------- traces in UI (no placeholders) ---------- */
+
 function traceIssuedFences(aiOutput){
   const blocks = parseFencedBlocks(aiOutput);
   for(const b of blocks){
     if (b.tag==='action')  sys('Action issued');
-    else if (b.tag==='memory') {
-      sys('Memory update issued');
-    }
-    else if (b.tag==='interest') {
-      //sys('Interest marker issued');
-    }
+    else if (b.tag==='memory') sys('Memory update issued');
     else sys('Block '+b.tag+' issued');
   }
 }
+
 function traceRouterResult(router){
   if (!router) return;
   const handled = Array.isArray(router.handled) ? router.handled : [];
@@ -790,10 +845,6 @@ function traceRouterResult(router){
       addBubble('sys', 'Action '+intent+': '+note);
     } else if (h.tag==='memory'){
       sys('Memory '+(h.status||'ok')+(h.fact?': '+h.fact:''));
-    } else if (h.tag==='interest' || h.tag==='interest_sanitized'){
-      // addBubble('sys', 'Interest logged');
-    } else if (h.tag==='debug'){
-      //
     } else {
       sys('Handled '+(h.tag||'block'));
     }
@@ -804,11 +855,10 @@ function traceRouterResult(router){
   });
 }
 
-/* Msg queue */
 function scheduleTurn() {
   if (inFlight) return;
-  if (tailRole() === 'assistant'){           // prevent arming when assistant spoke last
-    clearPending();                          // keep bar visible, switch to Idle
+  if (tailRole() === 'assistant'){
+    clearPending();
     pendingTextEl.textContent = 'Idle (awaiting user)';
     updatePendingText();
     return;
@@ -819,16 +869,14 @@ function scheduleTurn() {
       typingTimer = setTimeout( performModelTurn, typingInitMs);
       typingETA = Date.now() + typingInitMs;
     }
-    return; // don't go to normal pending as long as ime is up
+    return;
   }
   if (pendingTimer) clearTimeout(pendingTimer);
   pendingTimer = setTimeout(performModelTurn, debounceMs);
   showPending(debounceMs);
 }
 
-/* ---------- main ---------- */
 async function sendMessage(){
-  // enqueue-only; no network call here
   const q = box.value.trim();
   if (!q) return;
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
@@ -837,14 +885,13 @@ async function sendMessage(){
   history.push({ role: 'user', content: q });
   queuedCount++;
 
-  // cancel any in-flight scheduled send and re-arm a new silence window
   if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
   clearPending();
   scheduleTurn();
 }
 
 async function performModelTurn() {
-  if (tailRole() === 'assistant'){           // prevent accidental sends
+  if (tailRole() === 'assistant'){
     clearPending();
     pendingTextEl.textContent = 'Idle (awaiting user)';
     updatePendingText();
@@ -855,9 +902,11 @@ async function performModelTurn() {
   inFlight = true;
   btn.disabled = true;
   clearPending();
-  const turnStartQueued = queuedCount;   // snapshot to detect new msgs during turn
+  const turnStartQueued = queuedCount;
   if (lastTurnQueuedCount === queuedCount) {
     sys('Tried to submit API req with no new msg.');
+    inFlight = false;
+    btn.disabled = false;
     return;
   }
   lastTurnQueuedCount = turnStartQueued;
@@ -865,9 +914,6 @@ async function performModelTurn() {
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
 
   try{
-    await ensureTaskContextOnce();
-    if (typeof injectMemoriesOnce === 'function') await injectMemoriesOnce();
-
     const r = await fetch('', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -877,41 +923,65 @@ async function performModelTurn() {
     if (j.error){ addBubble('assistant', 'Error: ' + j.error); return; }
 
     const ans = String(j.answer ?? '');
-    await handleAiOutput(ans);
+    const toolCalls = Array.isArray(j.assistant_tool_calls) ? j.assistant_tool_calls : [];
+    await handleAiOutput(ans, toolCalls, 0);
 
   } finally {
     inFlight = false;
     btn.disabled = false;
 
-    // If more user messages arrived during the turn, arm a new silence window
     if (queuedCount > lastTurnQueuedCount) {
       scheduleTurn();
     }
   }
 }
 
-// output handler: store raw (with fences) in history; show stripped to user
-async function handleAiOutput(aiOutput, depth = 0){
-  if (!aiOutput) return;
-  const raw = String(aiOutput);                  // keep fences
-  const visible = stripFences(raw) || '*command*';
+async function handleAiOutput(aiOutput, toolCalls = [], depth = 0){
+  if (!aiOutput && !(Array.isArray(toolCalls) && toolCalls.length)) return;
+  const raw = String(aiOutput);
+  const visible = stripFences(raw) || '*command*'; // visible should be non-empty.
 
-  addBubble('assistant', visible);               // user-view
-  history.push({ role: 'assistant', content: raw });  // RAW in history
+
+  //addBubble('assistant', visible);
+  const parts = visible.split(/\n\n+/);
+  for (let i = 0; i < parts.length; i++) {
+    setTimeout(() => addBubble('assistant', parts[i]), i * lineInterval); 
+  }
+  
+  if (Array.isArray(toolCalls) && toolCalls.length){
+    history.push({ role:'assistant', content: raw, tool_calls: toolCalls });
+  } else {
+    history.push({ role:'assistant', content: raw });
+  }
 
   traceIssuedFences(raw);
   applyDebugOps(parseFencedBlocks(raw));
+  applyDebugOpsFrom(toolCalls, null);
 
   let router = null;
   try {
-    router = await routeBlocks(raw);
+    router = await routeBlocks(raw, toolCalls);
     traceRouterResult(router);
+    applyDebugOpsFrom(toolCalls, router);
+    // push ready tool messages returned by router (API-level calls)
     if (router) {
-      history.push({ role: 'system', content: 'tool:router_result ' + JSON.stringify(router) });
-      history.push({ role: 'user', content: 'Continue with router results' });
+      if (Array.isArray(router.tool_messages) && router.tool_messages.length > 0) {
+        for (const tm of router.tool_messages) {
+          if (!tm || typeof tm !== 'object') continue;
+          history.push({
+            role: 'tool',
+            tool_call_id: String(tm.tool_call_id || ''),
+            content: String(tm.content || '')
+          });
+        }
+      } else {
+        history.push({ role: 'system', content: 'function result: ' + JSON.stringify(router) })
+        history.push({ role: 'user', content: 'Continue your response with the last function result' });
+      }
     }
-  } catch {
-    addBubble('sys', 'Router error');
+  } catch (error) {
+    console.error('Router error:', error);
+    addBubble('sys', `Router error: ${error.message}`);
   }
 
   if (depth >= MAX_CHAIN) return;
@@ -923,18 +993,22 @@ async function handleAiOutput(aiOutput, depth = 0){
     const r2 = await fetch('', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ messages: history })
+      body: JSON.stringify({ 
+        messages: history, 
+        last_func_call: Array.isArray(toolCalls) ? toolCalls : []
+      })
     });
     const j2 = await r2.json();
     if (!j2.error){
-      await handleAiOutput(String(j2.answer ?? ''), depth + 1);  // pass RAW
+      const toolCalls2 = Array.isArray(j2.assistant_tool_calls) ? j2.assistant_tool_calls : [];
+      await handleAiOutput(String(j2.answer ?? ''), toolCalls2, depth + 1);
     } else {
       addBubble('sys', 'followup_error: ' + j2.error);
     }
     return;
   }
 
-  const interest = extractInterest(raw);
+  const interest = resolveInterest(raw, toolCalls, router);
   if (interest){
     const p = Math.max(0, Math.min(1, interest.confidence + 0.2));
     if (Math.random() < p){
@@ -942,17 +1016,40 @@ async function handleAiOutput(aiOutput, depth = 0){
       const r3 = await fetch('', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ messages: history })
+        body: JSON.stringify({ 
+          messages: history,
+          last_func_call: Array.isArray(toolCalls) ? toolCalls : []
+        })
       });
       const j3 = await r3.json();
       if (!j3.error){
-        await handleAiOutput(String(j3.answer ?? ''), depth + 1); // pass RAW
+        const toolCalls3 = Array.isArray(j3.assistant_tool_calls) ? j3.assistant_tool_calls : [];
+        await handleAiOutput(String(j3.answer ?? ''), toolCalls3, depth + 1);
       } else {
         addBubble('sys', 'interest_followup_error: ' + j3.error);
       }
     }
   }
 }
+
+function safeParseJSON(s){ try{ return JSON.parse(String(s||'')); }catch{ return null; } }
+
+function getToolFnArgs(toolCalls, fnName){
+  if (!Array.isArray(toolCalls)) return null;
+  for (const tc of toolCalls){
+    if (!tc || tc.type !== 'function') continue;
+    const f = tc.function || {};
+    if ((f.name||'').toLowerCase() === fnName) return safeParseJSON(f.arguments);
+  }
+  return null;
+}
+
+function getRouterHandled(router, tag){
+  if (!router || !Array.isArray(router.handled)) return null;
+  for (const h of router.handled){ if (h && (h.tag||'').toLowerCase() === tag) return h; }
+  return null;
+}
+
 
 function applyDebugOps(blocks){
   blocks.forEach(b=>{
@@ -969,42 +1066,85 @@ function applyDebugOps(blocks){
   });
 }
 
+function applyDebugOpsFrom(toolCalls, router){
+  // prefer explicit tool call
+  const args = getToolFnArgs(toolCalls, 'debug');
+  let op = (args && typeof args.op === 'string') ? args.op.toLowerCase() : null;
+
+  // fallback to router-handled debug
+  if (!op){
+    const h = getRouterHandled(router, 'debug');
+    if (h && h.payload && typeof h.payload === 'string') op = h.payload.toLowerCase();
+  }
+  if (!op) return;
+
+  if (op === 'on'){
+    document.documentElement.setAttribute('data-debug','on');
+    addBubble('sys','Debug mode ON');
+  } else if (op === 'off'){
+    document.documentElement.setAttribute('data-debug','off');
+    addBubble('sys','Debug mode OFF');
+  }
+}
+
+function extractInterestFrom(toolCalls, router){
+  // prefer explicit tool call
+  let o = getToolFnArgs(toolCalls, 'interest');
+
+  // fallback to router-handled interest
+  if (!o){
+    const h = getRouterHandled(router, 'interest');
+    if (h && h.payload && typeof h.payload === 'object') o = h.payload;
+  }
+  if (!o) return null;
+
+  const conf = Number(o.confidence);
+  if (!isFinite(conf)) return null;
+  return {
+    topics: Array.isArray(o.topics) ? o.topics.slice(0,4) : [],
+    reason: typeof o.reason === 'string' ? o.reason : '',
+    confidence: Math.max(0, Math.min(1, conf))
+  };
+}
+
+function resolveInterest(aiOutput, toolCalls, router){
+  const a = extractInterestFrom(toolCalls, router);
+  if (a && (a.topics.length || a.reason)) return a;
+  const b = extractInterest(aiOutput);
+  return (b && (b.topics.length || b.reason)) ? b : null;
+}
+
 function tailRole(){ 
   return history.length ? history[history.length-1].role : ''; 
 }
 
-/* ---------- events ---------- */
-
 function handleKeyboardToggle(open){
-  if (open === _kbPrev) return;      // only on edges
+  if (open === _kbPrev) return;
   _kbPrev = open;
   isKeyboardOpen = open;
 
-  // Pause everything while keyboard/IME is open; resume on close
   if (open){
     if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
     if (typingTimer)  { clearTimeout(typingTimer);  typingTimer  = null; typingETA = 0; }
-    clearPending();                            // keep bar; show idle
+    clearPending();
     pendingTextEl.textContent = 'Idle (keyboard open)';
     updatePendingText();
   } else {
-    // keyboard closed: if a reply is pending (last is user), re-arm normal debounce
     if (!inFlight && tailRole() === 'user') scheduleTurn();
     else updatePendingText();
   }
 }
-
 
 btn.addEventListener('click', sendMessage);
 box.addEventListener('keydown', (e)=>{
   if (e.keyCode === 229) {
     rearmTypingGrace();
     return;
-  };   // IME composition in progress
+  };
   if (e.key === 'Enter' && !e.shiftKey) {  e.preventDefault(); sendMessage(); }
 });
 box.addEventListener('focus', () => {        
-  if (imeOpen()){                            // [NEW] pause immediately if keyboard/IME up on focus
+  if (imeOpen()){                            
     handleKeyboardToggle(true);            
     return;                                  
   }
@@ -1020,33 +1160,27 @@ box.addEventListener('focus', () => {
   updatePendingText();
 });
 box.addEventListener('input', (e) => {
-  if (e.isComposing || isComposing) {
+  const hasText = box.value.trim().length > 0;
+  if (e.isComposing || isComposing || hasText) {
     rearmTypingGrace();
     return;
   };
-  // cancel the pending model-send debounce
   if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
   clearPending();
 
-  // (re)arm the typing-idle grace; do NOT send box content
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
-  const hasText = box.value.trim().length > 0;
 
   if (hasText) {
     typingETA = Date.now() + typingIdleMs;
     typingTimer = setTimeout(() => {
       typingTimer = null; typingETA = 0;
-
-      // Only schedule a send if there is already a user message awaiting a reply
-      // (i.e., last role is 'user', and not currently sending)
       if (!inFlight && tailRole() === 'user') {
-        scheduleTurn();            // re-arm normal debounce (uses debounceMs)
+        scheduleTurn();
       } else {
-        updatePendingText();       // keep status accurate
+        updatePendingText();
       }
     }, typingIdleMs);
   } else {
-    // user cleared box; if a user message is pending, re-arm debounce immediately
     if (!inFlight && tailRole() === 'user') scheduleTurn();
   }
 });
@@ -1055,36 +1189,22 @@ box.addEventListener('blur', () => {
   if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; updatePendingText(); }
   if (!inFlight && !pendingTimer && queuedCount > lastTurnQueuedCount) scheduleTurn();
 });
-box.addEventListener('compositionstart', () => {   // [MOD] simplified
+box.addEventListener('compositionstart', () => {
   isComposing = true;
   handleKeyboardToggle(true);
 });
-box.addEventListener('compositionend', () => {     // [MOD] simplified
+box.addEventListener('compositionend', () => {
   isComposing = false;
-  handleKeyboardToggle(imeOpen());                 // stay paused if occlusion persists
 });
 
-// (older iOS fallback)
 box.addEventListener('touchstart', () => {
   if (!IS_TOUCH) return;               
-  // showToast('touchstart fired!');
   rearmTypingGrace();
 }, {passive:true});
 
 box.addEventListener('compositionupdate', () => {
-  // showToast('compositionupdate fired!');
   rearmTypingGrace();
 });
-
-
-function showToast(msg) {
-  const toast = document.createElement('div');
-  toast.textContent = msg;
-  toast.style.cssText = 'position:fixed;top:50px;left:50%;transform:translateX(-50%);background:black;color:white;padding:8px;border-radius:4px;z-index:9999';
-  document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 1000);
-}
-
 </script>
 
 </body>

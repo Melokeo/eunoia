@@ -1,0 +1,58 @@
+               ┌───────────┐
+               │ index.php │
+               └─────┬─────┘
+                     │ user input
+                     ▼
+               ┌──────────┐
+               │ messages │  (DB insert: user_msg_id, session_id)
+               └─────┬────┘
+                     │
+         ┌───────────┴───────────┐
+         │ Pre-API retrieval     │
+         │ (memory injection)    │
+         └───────────┬───────────┘
+                     │ utterance
+         ┌───────────▼───────────┐
+         │  Detector::detect     │
+         └───────────┬───────────┘
+                     │ entities/slots
+         ┌───────────▼───────────┐
+         │   Linker::link        │
+         │  (aliases, nodes,     │
+         │   evidence)           │
+         └──┬────────────────┬───┘
+            │                │
+   updates  │                │ seeds[]
+            │                ▼
+     ┌──────▼─────┐   ┌───────────────┐
+     │graph_nodes │   │Retrieval::sub │
+     │aliases,evid│   └──────┬────────┘
+     └────────────┘          │
+                             ▼
+                        ┌───────────┐
+                        │  Ranker   │
+                        └────┬──────┘
+                             │
+                             ▼
+                      ┌────────────┐
+                      │Render::pack│
+                      └────┬───────┘
+                           │
+                 inject `[Memory v1]`
+                           │
+                           ▼
+                      ┌─────────┐
+                      │   API   │
+                      └─────────┘
+                           │ reply
+                           ▼
+                      ┌──────────┐
+                      │ messages │ (assistant_msg_id)
+                      └────┬─────┘
+                           │
+                           ▼
+                   ┌─────────────┐
+                   │ Graph::log  │
+                   │ (graph_turns│
+                   │   + job)    │
+                   └─────────────┘
