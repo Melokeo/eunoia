@@ -395,7 +395,6 @@ function no_tail_tool(array &$msgs): void {
   $msgs[count($msgs) - 1] =  $last;
 }
 
-
 function prettyTrimmedJson(array $data, int $maxLen = 50): string {
     $trimFn = function (&$item) use ($maxLen, &$trimFn) {
         if (is_string($item)) {
@@ -412,4 +411,17 @@ function prettyTrimmedJson(array $data, int $maxLen = 50): string {
     $trimFn($data);
 
     return json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+}
+
+// if call is openai, tool_calls won't be correctly parsed, so just get rid of them.
+function discard_all_tools(array &$msgs): void {
+  foreach ($msgs as $i => $m) {
+    if ($m['role'] === 'tool') {
+      unset($msgs[$i]);
+    } else{
+      if (array_key_exists('tool_calls', $m)) {
+        unset($msgs[$i]['tool_calls']);
+      }
+    }
+  }
 }
