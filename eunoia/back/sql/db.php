@@ -6,8 +6,10 @@
 declare(strict_types=1);
 
 require_once '/var/lib/euno/sql/db-credential.php';
+require_once '/var/lib/euno/sql/db-helper/tool-msg-cleaning.php';
+require_once '/var/lib/euno/sql/db-helper/msg-timestamp.php';
 
-const ROLLING_WINDOW_ROWS = 600;
+const ROLLING_WINDOW_ROWS = 100;
 
 function db(): PDO {
   global $db_usr, $db_pwd;
@@ -62,14 +64,22 @@ function insert_message_id(string $sid, string $role, string $content, int $is_s
   $stmt = $pdo->prepare($sql);
   $stmt->execute([$sid, $role, $content, $model, $tin, $tout, $is_summary, $h, $toolCallId, $toolCallsJson]);
 
+  $id = null;
   if ($stmt->rowCount() > 0) {
-    return (int)$pdo->lastInsertId();                // new row
+    $id = (int)$pdo->lastInsertId();
+  } else {
+    $q = $pdo->prepare('SELECT id FROM messages WHERE session_id=? AND content_hash=? ORDER BY id DESC LIMIT 1');
+    $q->execute([$sid, $h]);
+    $fetched = $q->fetchColumn();
+    $id = $fetched !== false ? (int)$fetched : null;
   }
-  // ignored (duplicate) → fetch existing by unique content_hash within session
-  $q = $pdo->prepare('SELECT id FROM messages WHERE session_id=? AND content_hash=? ORDER BY id DESC LIMIT 1');
-  $q->execute([$sid, $h]);
-  $id = $q->fetchColumn();
-  return $id !== false ? (int)$id : null;
+  
+  // trigger diary check for assistant messages only
+  if ($id && $role === 'assistant' && !$is_summary) {
+    check_diary_trigger($sid);
+  }
+  
+  return $id;
 }
 
 function fetch_last_messages(string $sid, int $limit=200): array {
@@ -98,6 +108,31 @@ function rough_tokens(string $s): int {
   return (int) ceil($cjk + max(0,$latin)/4);
 }
 
+/**
+ * Fetch and prepare message history from DB.
+ * 
+ * @param int $max_msgs Maximum number of messages to fetch
+ * @return array Messages oldest→newest with '_ts' field for timestamping.
+ *               Returns ['messages' => array, 'was_trimmed' => bool]
+ */
+function fetch_and_prepare_history(int $max_msgs): array {
+  $rows = fetch_last_messages('', $max_msgs);  // oldest→newest
+  $was_trimmed = (count($rows) === $max_msgs);
+  
+  $window = [];
+  for ($i = count($rows) - 1; $i >= 0; $i--) {  // walk backwards (newest first)
+    $row = $rows[$i];
+    $m = ['role'=>$row['role'], 'content'=>$row['content'], '_ts'=>$row['ts'] ?? null];
+    add_tool_call_id($row, $m);
+    add_ass_tool_call($row, $m);
+    $m['content'] = filterContent($m['content']);
+    $window[] = $m;  // collecting newest→older
+  }
+  $window = array_reverse($window);  // send oldest→newest
+  
+  return ['messages' => $window, 'was_trimmed' => $was_trimmed];
+}
+
 function pack_messages_for_model(string $sid, array $system_stack, int $max_ctx=8192, int $reserve=1024): array {
   $budget = $max_ctx - $reserve;
   $out = [];
@@ -110,31 +145,34 @@ function pack_messages_for_model(string $sid, array $system_stack, int $max_ctx=
     $out[] = $m; $used += $t;
   }
 
-  $addSummary = false;
+  $add_summary = false;
 
-  // 2) DB rows are oldest→newest; take the most recent suffix that fits
-  $rows = fetch_last_messages($sid, ROLLING_WINDOW_ROWS);      // oldest→newest
-  $addSummary = (count($rows) === ROLLING_WINDOW_ROWS);  // trimmed → true
+  // 2) fetch and prepare history
+  $history_data = fetch_and_prepare_history(ROLLING_WINDOW_ROWS);
+  $window = $history_data['messages'];
+  $addSummary = $history_data['was_trimmed'];
 
-  $window = [];
-  for ($i = count($rows) - 1; $i >= 0; $i--) {  // walk backwards (newest first)
-    $row = $rows[$i];
-    $m = ['role'=>$row['role'], 'content'=>$row['content']];
-    add_tool_call_id($row, $m);
-    add_ass_tool_call($row, $m);
-
+  // Recompute tokens and trim head if exceeding budget
+  $remain = $budget - $used;
+  $tok = [];
+  $sum = 0;
+  foreach ($window as $idx => $m) {
     $t = rough_tokens($m['content']);
-    if ($used + $t > $budget) break;            // stop when adding would exceed budget
-    $window[] = $m;                              // collecting newest→older
-    $used += $t;
+    $tok[$idx] = $t;
+    $sum += $t;
   }
-  $window = array_reverse($window);             // send oldest→newest
+  apply_group_stamps($window, 5);
+
+  $used += $sum;
+
+  // Clean temp keys
+  foreach ($window as &$m) { unset($m['_ts']); }
   $window = reconcile_assistant_tool_sequence($window);
   no_tail_tool($window);
   // error_log('san - ' . json_encode($window[count($window) - 1], JSON_PRETTY_PRINT));
 
   // if trimmed and a summary exists, prepend it once
-  if ($addSummary && ($sum = fetch_latest_summary($sid))) {
+  if ($add_summary && ($sum = fetch_latest_summary($sid))) {
   $t = rough_tokens($sum['content'] ?? '');
   if ($used + $t <= $budget) {
       $out[] = ['role'=>$sum['role'], 'content'=>$sum['content']];
@@ -249,151 +287,16 @@ function summarize_via(callable $fnCallOpenAI, array $messages, int $maxTokens, 
   return $fnCallOpenAI($messages, $maxTokens, $temp);
 }
 
-/**
- * Ensure assistant tool_calls are followed by matching tool entries.
- * - If assistant has a call with no tool return => inject synthetic tool with empty content.
- * - If a tool has no preceding assistant call => drop it.
- * Input order: oldest → newest.
- */
-/**
- * Validate and repair assistant↔tool sequencing.
- * Invariants enforced:
- *  - For every assistant message with tool_calls_json = [{id:...}, ...],
- *    there are exactly N following tool messages matched in order by tool_call_id.
- *  - Stray tool messages (no pending assistant or mismatched id) are dropped.
- *  - If a matching tool message lacks tool_call_id, it is filled from the pending id.
- *  - If tools are missing when a non-tool message arrives, synthetic empty tool
- *    messages are inserted to satisfy the pending ids.
- *
- * Input:  $msgs oldest→newest, each item: ['role','content','tool_call_id','tool_calls_json', ...]
- * Output: repaired list oldest→newest.
- */
-function reconcile_assistant_tool_sequence(array $msgs): array {
-    $out = [];
-    $pending = [];                 // queue of ['id'=>string, 'need'=>bool] from the last assistant
-    $havePending = false;          // true iff pending belongs to the last assistant in $out
-
-    $flush_pending = function() use (&$out, &$pending, &$havePending) {
-        if ($havePending && $pending) {
-            // Insert synthetic empty tool messages for any unmet tool calls
-            foreach ($pending as $p) {
-                if ($p['need']) {
-                    $out[] = [
-                        'role' => 'tool',
-                        'content' => $p['placeholder'],
-                        'tool_call_id' => $p['id'],
-                    ];
-                }
-            }
-        }
-        $pending = [];
-        $havePending = false;
-    };
-
-    foreach ($msgs as $m) {
-        $role = $m['role'] ?? '';
-
-        if ($role === 'assistant') {
-            // New assistant: close out any prior pending first
-            $flush_pending();
-
-            // Parse tool_calls_json
-            $pending = [];
-            $havePending = true;
-            $tc = [];
-            if (!empty($m['tool_calls'])) {
-                //$tc = json_decode((string)$m['tool_calls'], true);
-                $tc = $m['tool_calls'];
-                if (json_last_error() !== JSON_ERROR_NONE || !is_array($tc)) {
-                    $tc = [];
-                }
-                $l = count($tc);
-                $t = prettyTrimmedJson($tc);
-                //error_log("tc det: len $l \n$t");
-            }
-            // Build ordered queue from assistant-declared calls
-            foreach ($tc as $call) {
-                $id = is_array($call) ? ($call['id'] ?? null) : null;
-                if (is_string($id) && $id !== '') {
-                    $pending[] = ['id' => $id, 'need' => true, 'placeholder' => is_really_no_response($call)? 'void function' : 'PLACEHOLDERx'];
-                }
-            }
-
-            if (empty($tc)) { $havePending = false; } else {
-              $e = prettyTrimmedJson($pending);
-              //error_log("pending = $e");
-            }
-
-            // Keep the assistant as-is
-            $out[] = $m;
-            continue;
-        }
-
-        if ($role === 'tool') {
-            if (!$havePending || !$pending) {
-                // No assistant expecting tools → drop stray tool
-                $t = prettyTrimmedJson($m);
-                //rror_log("Dropped tool:\n$t");
-                continue;
-            }
-            // Match against the head of the queue
-            $expected = $pending[0]['id'];
-            $tid = $m['tool_call_id'] ?? null;
-
-            if (!is_string($tid) || $tid === '') {
-                // Fill missing id with expected
-                $m['tool_call_id'] = $expected;
-                $tid = $expected;
-            }
-
-            if ($tid === $expected) {
-                // Consume one pending slot
-                $pending[0]['need'] = false;
-                array_shift($pending);
-                $out[] = $m;
-                // If all matched, clear the pending flag
-                if (!$pending) $havePending = false;
-            } else {
-                // Mismatched id → drop as stray
-                continue;
-            }
-            continue;
-        }
-
-        // Any other role breaks the pending chain: flush unmet tool calls, then pass through
-        $flush_pending();
-        $out[] = $m;
+function filterContent(string $text): string
+    {
+        $text = preg_replace('/function result:\s*(?<obj>\{(?:[^{}]++|(?&obj))*\})/u', 'function result: [result]', $text);
+        // add more filters here as needed
+        //$text = preg_replace('/~~~.*?~~~/s', '[cmd censored]', $text);
+        
+        return $text;
     }
 
-    // End: flush any unmet tools
-    $flush_pending();
-    return $out;
-}
 
-/* returns true if a function call normally lack tool msg */
-function is_really_no_response(array $tool_call): bool {
-  return false;
-  
-  $fname = $tool_call['function']['name'];
-  if (!isset($tool_call['function']['name'])) return false;
-  if ($fname === 'memory' || $fname === 'debug') return true;
-  return false;
-}
-
-function no_tail_tool(array &$msgs): void {
-  if (empty($msgs)) return;
-  $last = $msgs[count($msgs) - 1];
-  // error_log(json_encode($last, JSON_PRETTY_PRINT));
-  if ($last['role'] !== 'assistant') return;
-  if (array_key_exists('tool_calls', $last)) {
-    $last['tool_calls'] = null;
-    //error_log($last['tool_calls']);
-  } else {
-    // error_log('tool_calls: ok');
-  }
-
-  $msgs[count($msgs) - 1] =  $last;
-}
 
 function prettyTrimmedJson(array $data, int $maxLen = 50): string {
     $trimFn = function (&$item) use ($maxLen, &$trimFn) {
@@ -413,15 +316,48 @@ function prettyTrimmedJson(array $data, int $maxLen = 50): string {
     return json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 }
 
-// if call is openai, tool_calls won't be correctly parsed, so just get rid of them.
-function discard_all_tools(array &$msgs): void {
-  foreach ($msgs as $i => $m) {
-    if ($m['role'] === 'tool') {
-      unset($msgs[$i]);
-    } else{
-      if (array_key_exists('tool_calls', $m)) {
-        unset($msgs[$i]['tool_calls']);
-      }
-    }
+function increment_assistant_turn_counter(): int {
+  $file = '/var/lib/euno/.assistant_turn_count';
+  $lock = fopen($file, 'c+');
+  if (!$lock) return 0;
+  
+  if (flock($lock, LOCK_EX)) {
+    $count = (int)stream_get_contents($lock);
+    $count++;
+    ftruncate($lock, 0);
+    rewind($lock);
+    fwrite($lock, (string)$count);
+    fflush($lock);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    return $count;
   }
+  
+  fclose($lock);
+  return 0;
+}
+
+function check_diary_trigger(string $sid): void {
+  if (!should_trigger_diary(50)) return;
+  
+  $worker = '/var/lib/euno/lib/diary-writer.php';
+  if (!is_file($worker)) return;
+  
+  exec('php ' . escapeshellarg($worker) . ' ' . escapeshellarg($sid) . ' > /dev/null 2>&1 &');
+}
+
+function should_trigger_diary(int $interval = 50): bool {
+  $count = increment_assistant_turn_counter();
+  return ($count > 0 && $count % $interval === 0);
+}
+
+function update_pinecone(): bool {
+  $c = curl_init('http://127.0.0.1:5145/run');
+  curl_setopt($c, CURLOPT_POST, true);
+  curl_setopt($c, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, '{}');
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+  $response = curl_exec($ch);
+  $result = json_decode($response, true);
+  curl_close($ch);
 }
