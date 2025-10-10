@@ -8,13 +8,29 @@ declare(strict_types=1);
  * - Model: fast Responses API model
  */
 
-// const OPENAI_KEY_PATH = '/var/lib/euno/secrets/openai_key.json';
-// const OPENAI_API_URL  = 'https://api.openai.com/v1/responses';
-// const OPENAI_MODEL    = 'gpt-5-mini';
+/*const OPENAI_KEY_PATH = '/var/lib/euno/secrets/openai_key.json';
+const OPENAI_API_URL  = 'https://api.openai.com/v1/responses';
+const OPENAI_MODEL    = 'gpt-4o';
 const OPENAI_KEY_PATH = '/var/lib/euno/secrets/deepseek_key.json';
 const OPENAI_API_URL  = 'https://api.deepseek.com/chat/completions';
-const OPENAI_MODEL    = 'deepseek-chat';
+const OPENAI_MODEL    = 'deepseek-chat'; */
+/*const OPENAI_KEY_PATH = '/var/lib/euno/secrets/para_key.json';
+const OPENAI_API_URL  = 'https://llmapi.paratera.com/chat/completions';
+const OPENAI_MODEL    = 'DeepSeek-R1-0528';*/
+const OPENAI_KEY_PATH = '/var/lib/euno/secrets/claude_key.json';
+const OPENAI_API_URL  = 'https://api.anthropic.com/v1/messages';
+const OPENAI_MODEL    = 'claude-sonnet-4-5-20250929';
+const THINKING        = true;
+
 const MEM_ROOT        = '/var/lib/euno/memory';
+const OUTPUT_LOG      = '/var/log/euno/last-output.json';
+
+const TOOL_MODE       = false;
+const HISTORY_LINES   = 100;
+
+// open-ai-new, open-ai-old, claude
+const CURR_API_TYPE = 'claude';
+
 
 // Load system prompt (server-side only)
 $SYSTEM_PROMPT = '';
@@ -52,7 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
   $sid = ensure_session();
   
   // Load context using the function in create-context.php
-  $context = create_context($sid, $client_messages);
+  $context = create_context($sid, $client_messages, true, true);
   $outgoing = $context['messages'];
 
   $last_tool_call = $in['last_func_call'] ?? null;
@@ -71,7 +87,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
   $roleCounts = array_count_values(array_map(fn($m)=>$m['role'], $outgoing));
   $preview = array_map(function($m) use ($DBG_PREVIEW_CHARS){
     $c = (string)($m['content'] ?? '');
-    if ($m['role'] === 'tool') {error_log(json_encode($m, JSON_PRETTY_PRINT));}
+    // if ($m['role'] === 'tool') {error_log(json_encode($m, JSON_PRETTY_PRINT));}
     $logged = [
       'r'   => $m['role'],
       'len' => mb_strlen($c),
@@ -98,21 +114,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
   }
 
   // handling api tool call
-  $choice   = $resp['data']['choices'][0] ?? [];
-  $message  = $choice['message'] ?? [];
-  $toolCalls= is_array($message['tool_calls'] ?? null) ? $message['tool_calls'] : [];
-
-  $answer_raw = isset($message['content']) ? sanitize_punct((string)$message['content']) : '';  // may contain fences
-  // --- debug tap: post-call (readable) ---
-  /*
-  error_log(json_encode([
-    't'=>'post','rid'=>$rid,'sid'=>$sid,
-    'answer_len'=>mb_strlen($answer_raw)
-    'answer'=>mb_substr($answer_raw, 0, $DBG_PREVIEW_CHARS)   // <-- readable content
-  ], JSON_UNESCAPED_UNICODE)."\n", 3, '/var/log/euno/chat.jsonl');
-  */
-
-
+  $message  = $resp['data']['content'] ?? [];
+  $answer_raw = extract_text($resp['data']);  // may contain fences
 
   // ------- persist history (append-only, idempotent) -------
   try {
@@ -126,7 +129,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
 
           // marker injected by frontend after routing
           //   history.push({ role:'system', content:'tool:router_result ' + JSON.stringify(router) });
-          if ($role === 'system' && strncmp($content, 'router result: ', 15) === 0) {
+          if ($role === 'system' && strncmp($content, 'function result: ', 15) === 0) {
               // keep the system trace; comment next line if not desired
               insert_message($sid, 'system', $content);
               $skip_next_user_once = true;     // next user line is ephemeral nudge
@@ -138,7 +141,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
             if (stripos($content, 'continue') !== 0) {
               insert_message($sid, 'user', $content); // compatible if nudge no longer needed
             }
-            $skip_next_user_once = true;     // next user line is ephemeral nudge
+            $skip_next_user_once = false;    
             continue;
           }
 
@@ -168,6 +171,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
                   strpos($lc, '```task context policy:') === 0 ||
                   strpos($lc, 'memories:') === 0 ||
                   strpos($lc, 'current time is:') === 0 ||
+                  strpos($lc, '现在时间') === 0 ||
                   strncmp($content, '[Memory', 11) === 0 ||
                   preg_match('/^(\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2})/i', $content)
               )) {
@@ -195,7 +199,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
   }
 
   echo json_encode([
-    'answer'               => (string)($message['content'] ?? ''),
+    'answer'               => (string)($answer_raw ?? ''),
     'assistant_tool_calls' => $toolCalls
   ], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
 
@@ -253,36 +257,109 @@ function load_key(): string {
 }
 
 function call_openai(array $messages, string $apiKey): array {
-    $payload = [
+    $TOOLS = require '/var/lib/euno/memory/tool-functions.php';
+    if (CURR_API_TYPE === 'open-ai-new') {
+      $payload = [
         'model' => OPENAI_MODEL,
         'input' => $messages,
-        'max_output_tokens' => 2048,
-        'text' => [ 'verbosity' => 'low' ],
-        'reasoning' => [ 'effort' => 'low' ], // adapted 202508
-    ];
-    // ds
-    $TOOLS = require '/var/lib/euno/memory/tool-functions.php';
-    $payload = [
-        'model'      => 'deepseek-chat',        
-        'messages'   => $messages,          
-        'max_tokens' => 2048,
-        'tools'      => $TOOLS,
-        'temperature'=> 1.3,                
-        // 'stream'   => true,               // optional: if streaming will be added later
-        'frequency_penalty' => 0.7,
-        'presence_penalty' => 0.5,  
-    ];
+        'max_output_tokens' => 12048,
+        'text' => [ 'verbosity' => 'medium' ],
+        'reasoning' => [ 'effort' => 'medium' ], // adapted 202508
+        //'tools'      => $TOOLS
+      ];
+    } else if ((CURR_API_TYPE === 'open-ai-old')) {
+      // ds
+      $payload = [
+          'model'      => OPENAI_MODEL,        
+          'messages'   => $messages,          
+          'max_tokens' => 8192,
+          // 'tools'      => $TOOLS,
+          'temperature'=> 0.3,                
+          // 'stream'   => true,               // optional: if streaming will be added later
+          'frequency_penalty' => 1.7,
+          'presence_penalty' => 1.7,  
+      ];
+    } else {
+      // claude - cache only: personality, task context, memories
+      // separate stable (cacheable) from dynamic (uncacheable) system messages
+      $stable = [];
+      $dynamic = [];
+
+      foreach (array_slice($messages, 0, 5) as $m) {
+        if (($m['role'] ?? '') !== 'system') continue;
+        $c = $m['content'];
+        
+        // dynamic content goes to end, uncached
+        if (stripos($c, 'Current time is:') === 0 || stripos($c, '[Memory v2]') === 0 || stripos($c, '现在时间') === 0) {
+          $dynamic[] = $c;
+          continue;
+        }
+        
+        // everything else is stable and cached
+        $stable[] = $c;
+      }
+
+      // build blocks: all stable content cached, then dynamic uncached
+      $sys_blocks = array_map(
+        fn($text) => ['type' => 'text', 'text' => $text, 'cache_control' => ['type' => 'ephemeral']], 
+        $stable
+      );
+
+      foreach ($dynamic as $text) {
+        $sys_blocks[] = ['type' => 'text', 'text' => $text];
+      }
+      
+      /*error_log('=== CACHE DEBUG ===');
+      foreach ($sys_blocks as $i => $block) {
+        $has_cache = isset($block['cache_control']);
+        $preview = substr($block['text'], 0, 50);
+        error_log("Block $i [cache=$has_cache]: $preview...");
+      }*/
+
+      $mc = array_slice($messages, 5);
+      $payload = [
+        'model' => OPENAI_MODEL,
+        'messages' => $mc,
+        'system' => $sys_blocks,
+        'max_tokens' => 8192,
+        'temperature' => 1,
+      ];
+
+      if (THINKING) {
+        $payload['thinking'] = [
+          "type" => "enabled",
+          "budget_tokens" => 2000
+        ];
+      }
+    }
+    
+    if (TOOL_MODE) {$payload['tools'] = $TOOLS;}
     $ch = curl_init(OPENAI_API_URL);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST           => true,
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            'Authorization: Bearer ' . $apiKey,
-        ],
-        CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
-        CURLOPT_TIMEOUT        => 25,
-    ]);
+
+    if (CURR_API_TYPE !== 'claude') {
+      curl_setopt_array($ch, [
+          CURLOPT_RETURNTRANSFER => true,
+          CURLOPT_POST           => true,
+          CURLOPT_HTTPHEADER     => [
+              'Content-Type: application/json',
+              'Authorization: Bearer ' . $apiKey,
+          ],
+          CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+          CURLOPT_TIMEOUT        => 60,
+      ]);
+    } else {
+      curl_setopt_array($ch, [
+          CURLOPT_RETURNTRANSFER => true,
+          CURLOPT_POST           => true,
+          CURLOPT_HTTPHEADER     => [
+              'x-api-key: ' . $apiKey,
+              'anthropic-version: 2023-06-01',
+              'Content-Type: application/json'
+          ],
+          CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+          CURLOPT_TIMEOUT        => 30,
+      ]);
+    }
     $raw  = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     if ($raw === false) {
@@ -295,48 +372,76 @@ function call_openai(array $messages, string $apiKey): array {
     $json = json_decode($raw, true);
     if ($code >= 400 || !is_array($json)) {
         $msg = is_array($json) && isset($json['error']['message']) ? $json['error']['message'] : ('HTTP ' . $code);
-        error_log('[deepseek] raw=' . substr($raw, 0, 2000) . $msg); 
+        error_log('[AI] raw=' . substr($raw, 0, 2000) . $msg); 
         return ['error' => $msg];
     }
-    // error_log('[deepseek] raw=' . substr($raw, 0, 2000)); 
+    
+    file_put_contents(OUTPUT_LOG, json_encode($json, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
     return ['data' => $json];
 }
 
 function extract_text(array $resp): string {
-  /* // BELOW IS FOR CHATGPT
+  $resp = is_array($resp) ? $resp : json_decode((string)$resp, true);
+  if (CURR_API_TYPE === 'open-ai-new') {
+   // BELOW IS FOR CHATGPT
     if (isset($resp['output_text']) && is_string($resp['output_text'])) return sanitize_punct($resp['output_text']);
     if (isset($resp['output']) && is_array($resp['output'])) {
         $buf = [];
         foreach ($resp['output'] as $part) {
-            if (isset($part['content'][0]['text'])) { $buf[] = $part['content'][0]['text']; }
+          if (isset($part['content'][0]['text'])) { $buf[] = $part['content'][0]['text']; }
             elseif (isset($part['text'])) { $buf[] = $part['text']; }
         }
         if ($buf) return sanitize_punct(implode("\n", $buf));
     }
     return sanitize_punct(json_encode($resp, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-  */
-  //BELOW IS FOR DEEPSUCK
-  $msg = $resp['choices'][0]['message'] ?? [];
-  if (!empty($msg['content'])) {
-    //error_log('[deepseek] msg=' . $msg['content']);
-    return sanitize_punct($msg['content']);
-  }
-  if (!empty($msg['reasoning_content'])) return (string)$msg['reasoning_content'];
 
-  //error_log('[deepseek] msg=' . $msg['content'] . '. Parsed nothing!');
-  return '';
+  } else if (CURR_API_TYPE === 'open-ai-old') {
+    $msg = $resp['choices'][0]['message'] ?? [];
+    if (!empty($msg['content'])) {
+      //error_log('[deepseek] msg=' . $msg['content']);
+      return sanitize_punct($msg['content']);
+    }
+    if (!empty($msg['reasoning_content'])) return (string)$msg['reasoning_content'];
+
+    //error_log('[deepseek] msg=' . $msg['content'] . '. Parsed nothing!');
+    return '';
+  } else {
+    // handle both thinking and non-thinking responses
+    $msg = '';
+    
+    foreach ($resp['content'] as $block) {
+      if ($block['type'] === 'thinking') {
+        // optionally log or skip thinking blocks
+        // error_log('[claude] thinking: ' . $block['thinking']);
+        continue;
+      }
+      
+      if ($block['type'] === 'text') {
+        $msg = $block['text'];
+        break;  // get first text block
+      }
+    }
+    
+    if ($msg !== '') {
+      // error_log('[claude] msg=' . $msg);
+      return sanitize_punct($msg);
+    }
+    error_log('[claude] msg=' . $msg . '. Parsed nothing!');
+    return '';
+  }
 }
 
 // forbid —, –, and -- in final output.
 function sanitize_punct(string $s): string {
     // Replace any em/en dash or double hyphen (with surrounding spaces) by a comma+space
-    $s = preg_replace('/\h*(?:—|–|--|-)\h*/u', ', ', $s);
+    $s = preg_replace('/(?<=\h)(?:—|–|--|-)(?=\h)/u', ', ', $s);
     // Collapse duplicate commas/spaces
     $s = preg_replace('/\s*,\s*,+/', ', ', $s);
-    $s = preg_replace('/\s{2,}/', ' ', $s);
+    // Preserve double newlines but collapse other multiple whitespace
+    $s = preg_replace('/[ \t]{2,}/', ' ', $s);  // collapse spaces/tabs only
+    $s = preg_replace('/\n{3,}/', '\n\n', $s);  // max 2 consecutive newlines
     return trim($s);
 }
-
 function preserve_tool_call(array &$messages, array $tool_calls): void {
   $l = count($messages);
   $last_msg = $messages[$l - 1];
@@ -365,4 +470,884 @@ if (is_file($sysPath) && is_readable($sysPath)) {
 
 ?>
 
-<!doctypehtml><html data-debug="off"lang="en"><meta charset="utf-8"><title>M.ICU - Eunoia</title><meta content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content"name="viewport"><style>:root{--bg:#0b0c0f;--panel:#11141a;--muted:#9aa0aa;--fg:#e9eef4;--accent:#5aa1ff;--border:#1c2230}*{box-sizing:border-box}body,html{height:100%;overflow:hidden;overscroll-behavior:none;overflow-anchor:none}html{background:#0b0c0f}.wrap{position:fixed;inset:0;height:100svh}.chat{padding-bottom:calc(18px + var(--kb,0px))}.inputbar{padding-bottom:max(12px,env(safe-area-inset-bottom))}body{margin:0;background:linear-gradient(180deg,#0b0c0f,#0d1117);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;color:var(--fg);overflow:hidden}.wrap{max-width:860px;margin:0 auto;padding:0 14px;height:100svh;display:flex}.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:grid;grid-template-rows:auto auto 1fr auto auto;height:100%;width:100%;overflow:hidden}header{padding:16px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}h1{margin:0;font-size:16px;letter-spacing:.2px}.meta{color:var(--muted);font-size:12px}.chat{overflow:auto;padding:18px;display:flex;flex-direction:column;gap:12px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.msg{max-width:80%;padding:12px 14px;border-radius:12px;white-space:pre-wrap}.user{align-self:flex-end;background:#1b2230;border:1px solid #2a3145}.assistant{align-self:flex-start;background:#0f1218;border:1px solid #1f2738}.sys{align-self:center;color:var(--muted);font-size:12px;line-height:1.2;margin:0;padding:0}.inputbar{display:flex;gap:10px;padding:12px 16px;border-top:1px solid var(--border);background:var(--panel)}textarea{flex:1;min-height:68px;max-height:160px;padding:10px;background:#0f1218;border:1px solid var(--border);border-radius:10px;color:var(--fg);resize:vertical;font:inherit}button{background:var(--accent);color:#071120;border:0;border-radius:10px;padding:10px 16px;font:600 14px/1 system-ui;cursor:pointer}button:hover{filter:brightness(1.05)}.small{font-size:12px;color:var(--muted);padding:0 16px 12px;background:var(--panel)}.pending{font-size:12px;color:var(--muted);display:grid;grid-template-columns:auto 1fr;align-items:start;gap:6px 16px;background:var(--panel);padding:0 6px}.pending.on{display:block}.pending .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:6px;animation:blink 1s infinite}.pending .vars{margin-top:2px;font-size:11px;color:#666;white-space:pre-line}.pending .status{display:flex;align-items:center;gap:6px}.pending .vars{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:4px 12px;font:11px/1.25 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8a94a6;white-space:normal}.pending .kv{display:flex;justify-content:space-between;gap:8px}.pending .k{opacity:.75}.pending .v{text-align:right}@keyframes blink{0%,100%{opacity:.3}50%{opacity:1}}:root[data-debug=off] #pending #pendingText,:root[data-debug=off] #pending .dot,:root[data-debug=off] #pending .vars{visibility:hidden}:root[data-debug=off] #pending{padding:2px 16px;min-height:6px;line-height:0;border-bottom-color:transparent;background:var(--panel)}html.ime-open #pending{padding:2px 16px}html.ime-open body{overflow:hidden}html.ime-open .chat{scroll-behavior:auto}html.ime-open{position:fixed;width:100%}</style><div class="wrap"><div class="card"><header><h1>Eunoia</h1><div class="meta">Session history is in-page only</div></header><div class="pending"id="pending"aria-live="polite"><div class="status"><span class="dot"></span><span id="pendingText">Waiting…</span></div><div class="vars"id="pendingVars"></div></div><div class="chat"id="chat"></div><div class="inputbar"><textarea id="box"placeholder="Type a message..."></textarea> <button id="send">Send</button></div><div class="small">Key:<?=htmlspecialchars(OPENAI_KEY_PATH)?>| Endpoint:<?=htmlspecialchars(OPENAI_API_URL)?></div></div></div><script>const chat=document.getElementById("chat"),box=document.getElementById("box"),btn=document.getElementById("send"),pendingEl=document.getElementById("pending"),pendingTextEl=document.getElementById("pendingText"),MAX_CHAIN=3,KB_EPS=24,IS_LIKELY_IOS=/iP(hone|ad|od)/i.test(navigator.userAgent)||/Mac/i.test(navigator.userAgent)&&"ontouchend"in document,IS_TOUCH="ontouchstart"in window||navigator.maxTouchPoints>0,history=[];let inFlight=!1,debounceMs=1500,pendingTimer=null,pendingTick=null,pendingETA=0,queuedCount=0,lastTurnQueuedCount=0,isComposing=!1,isKeyboardOpen=!1,_kbPrev=!1,typingTimer=null,typingIdleMs=6e3,typingInitMs=1800,typingETA=0,lineInterval=1601;function rearmTypingGrace(){pendingTimer&&(clearTimeout(pendingTimer),pendingTimer=null),clearPending(),typingTimer&&(clearTimeout(typingTimer),typingTimer=null,typingETA=0),typingETA=Date.now()+typingIdleMs,typingTimer=setTimeout(()=>{typingTimer=null,typingETA=0,inFlight||"user"!==tailRole()?updatePendingText():scheduleTurn()},typingIdleMs),updatePendingText()}function imeOpen(){if(isComposing)return!0;const e=document.activeElement===box;if(!e)return!1;const t=window.visualViewport;if(t){if(window.innerHeight-(t.height+t.offsetTop)>24)return!0}return IS_LIKELY_IOS&&e}function debugOn(){return"off"!==document.documentElement.getAttribute("data-debug")}function sys(e){debugOn()&&addBubble("sys",e)}function addBubble(e,t){const n=document.createElement("div");n.className="msg "+("user"===e?"user":"assistant"===e?"assistant":"sys"),"assistant"===e&&(t=renderVisible(t)),n.textContent=t,chat.appendChild(n),chat.scrollTop=chat.scrollHeight}function showPending(e){pendingETA=Date.now()+e,pendingEl.classList.add("on"),updatePendingText()}function clearPending(){pendingETA=0,pendingTick&&(clearInterval(pendingTick),pendingTick=null),pendingTextEl.textContent="Idle",updatePendingText()}function esc(e){return String(e).replace(/[&<>"']/g,e=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[e]))}function setVars(e){const t=document.getElementById("pendingVars");"off"!==document.documentElement.getAttribute("data-debug")?t.innerHTML=Object.entries(e).map(([e,t])=>`<div class="kv"><span class="k">${esc(e)}</span><span class="v">${esc(t)}</span></div>`).join(""):t.innerHTML=""}function updatePendingText(){const e=!!pendingTimer,t=!!typingTimer;if(inFlight)pendingTextEl.textContent="Sending…";else if(e){const e=Math.max(0,pendingETA-Date.now());pendingTextEl.textContent=`Pending send in ${(e/1e3).toFixed(1)}s`}else if(t){const e=Math.max(0,typingETA-Date.now()),t=box===document.activeElement?box.value.trim()?"typing grace":"focus grace":"typing grace";pendingTextEl.textContent=`${t} ${(e/1e3).toFixed(1)}s`}else if(isComposing)pendingTextEl.textContent="IME composing";else if(imeOpen())pendingTextEl.textContent="Idle (keyboard open)";else{const e="assistant"===tailRole()?" (awaiting user)":"";pendingTextEl.textContent="Idle"+e}const n=document.getElementById("pendingVars");"off"!==document.documentElement.getAttribute("data-debug")?setVars({pendingTimer:!!pendingTimer,lastTurnQueuedCount:lastTurnQueuedCount,inFlight:inFlight,queuedCount:queuedCount-lastTurnQueuedCount,tailRole:tailRole(),typingTimer:!!typingTimer,isComposing:isComposing,isKeyboardOpen:isKeyboardOpen}):n.textContent=""}function parseFencedBlocks(e){const t=/~~~(\w+)\s*(\{[\s\S]*?\})\s*~~~/giu,n=[];let i;for(;i=t.exec(e);)try{n.push({tag:(i[1]||"").toLowerCase(),json:JSON.parse(i[2])})}catch{}return n}function stripFences(e){return e=String(e||"").replace(/~~~\w+\s*\{[\s\S]*?\}\s*~~~/g,"").trim()}function renderVisible(e){return e=e.replace(/\s*(?:—|–|--|-)\s*/g,", "),String(e||"").replace(/~~~action[\s\S]*?~~~\s*/g,"[ACT]").replace(/~~~memory[\s\S]*?~~~\s*/g,"[MEM]").replace(/~~~interest[\s\S]*?~~~\s*/g,"[INT]").trim()}async function routeBlocks(e,t){const n=/~~~\w+[\s\S]*?~~~/m.test(e),i=Array.isArray(t)&&t.length>0;if(!n&&!i)return null;const o=await fetch("action_router.php",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ai_output:String(e||""),tool_calls:i?t:void 0}),credentials:"same-origin"});if(!o.ok)throw new Error("router http "+o.status);return await o.json()}function extractInterest(e){const t=parseFencedBlocks(e);let n=(t.find(e=>"interest"===e.tag)||{}).json||null;if(!n)for(const e of t){const t=e.json||{};if(Array.isArray(t.topics)&&"number"==typeof t.confidence){n=t;break}}if(!n)return null;const i=Math.max(0,Math.min(1,Number(n.confidence)));return isFinite(i)?{topics:Array.isArray(n.topics)?n.topics.slice(0,4):[],reason:"string"==typeof n.reason?n.reason:"",confidence:i}:null}function traceIssuedFences(e){const t=parseFencedBlocks(e);for(const e of t)"action"===e.tag?sys("Action issued"):"memory"===e.tag?sys("Memory update issued"):sys("Block "+e.tag+" issued")}function traceRouterResult(e){if(!e)return;const t=Array.isArray(e.handled)?e.handled:[],n=Array.isArray(e.unhandled)?e.unhandled:[];t.forEach(e=>{if(e)if("action"===e.tag){addBubble("sys","Action "+(e.intent||"action")+": "+(e.note||e.status||(e.result?"ok":"not_found")))}else"memory"===e.tag?sys("Memory "+(e.status||"ok")+(e.fact?": "+e.fact:"")):sys("Handled "+(e.tag||"block"))}),n.forEach(e=>{e&&addBubble("sys","Unhandled "+(e.tag||"block")+(e.error?": "+e.error:""))})}function scheduleTurn(){if(!inFlight){if("assistant"===tailRole())return clearPending(),pendingTextEl.textContent="Idle (awaiting user)",void updatePendingText();if(imeOpen()){box.value.trim().length>0||(typingTimer=setTimeout(performModelTurn,typingInitMs),typingETA=Date.now()+typingInitMs)}else pendingTimer&&clearTimeout(pendingTimer),pendingTimer=setTimeout(performModelTurn,debounceMs),showPending(debounceMs)}}async function sendMessage(){const e=box.value.trim();e&&(typingTimer&&(clearTimeout(typingTimer),typingTimer=null,typingETA=0),addBubble("user",e),box.value="",history.push({role:"user",content:e}),queuedCount++,pendingTimer&&(clearTimeout(pendingTimer),pendingTimer=null),clearPending(),scheduleTurn())}async function performModelTurn(){if("assistant"===tailRole())return clearPending(),pendingTextEl.textContent="Idle (awaiting user)",void updatePendingText();if(inFlight)return;inFlight=!0,btn.disabled=!0,clearPending();const e=queuedCount;if(lastTurnQueuedCount===queuedCount)return sys("Tried to submit API req with no new msg."),inFlight=!1,void(btn.disabled=!1);lastTurnQueuedCount=e,pendingTimer&&(clearTimeout(pendingTimer),pendingTimer=null),typingTimer&&(clearTimeout(typingTimer),typingTimer=null);try{const e=await fetch("",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:history})}),t=await e.json();if(t.error)return void addBubble("assistant","Error: "+t.error);const n=String(t.answer??""),i=Array.isArray(t.assistant_tool_calls)?t.assistant_tool_calls:[];await handleAiOutput(n,i,0)}finally{inFlight=!1,btn.disabled=!1,queuedCount>lastTurnQueuedCount&&scheduleTurn()}}async function handleAiOutput(e,t=[],n=0){if(!(e||Array.isArray(t)&&t.length))return;const i=String(e),o=(stripFences(i)||"*command*").split(/\n\n+/);for(let e=0;e<o.length;e++)setTimeout(()=>addBubble("assistant",o[e]),e*lineInterval);Array.isArray(t)&&t.length?history.push({role:"assistant",content:i,tool_calls:t}):history.push({role:"assistant",content:i}),traceIssuedFences(i),applyDebugOps(parseFencedBlocks(i)),applyDebugOpsFrom(t,null);let r=null;try{if(r=await routeBlocks(i,t),traceRouterResult(r),applyDebugOpsFrom(t,r),r)if(Array.isArray(r.tool_messages)&&r.tool_messages.length>0)for(const e of r.tool_messages)e&&"object"==typeof e&&history.push({role:"tool",tool_call_id:String(e.tool_call_id||""),content:String(e.content||"")});else history.push({role:"system",content:"function result: "+JSON.stringify(r)}),history.push({role:"user",content:"Continue your response with the last function result"})}catch(e){console.error("Router error:",e),addBubble("sys","Router error: "+e.message)}if(n>=3)return;if((r&&Array.isArray(r.handled)?r.handled:[]).some(e=>e&&"action"===e.tag)){const e=await fetch("",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:history,last_func_call:Array.isArray(t)?t:[]})}),i=await e.json();if(i.error)addBubble("sys","followup_error: "+i.error);else{const e=Array.isArray(i.assistant_tool_calls)?i.assistant_tool_calls:[];await handleAiOutput(String(i.answer??""),e,n+1)}return}const s=resolveInterest(i,t,r);if(s){const e=Math.max(0,Math.min(1,s.confidence+.2));if(Math.random()<e){sys("Interest trigger p="+e.toFixed(2)+(s.topics.length?" ["+s.topics.join(", ")+"]":""));const i=await fetch("",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({messages:history,last_func_call:Array.isArray(t)?t:[]})}),o=await i.json();if(o.error)addBubble("sys","interest_followup_error: "+o.error);else{const e=Array.isArray(o.assistant_tool_calls)?o.assistant_tool_calls:[];await handleAiOutput(String(o.answer??""),e,n+1)}}}}function safeParseJSON(e){try{return JSON.parse(String(e||""))}catch{return null}}function getToolFnArgs(e,t){if(!Array.isArray(e))return null;for(const n of e){if(!n||"function"!==n.type)continue;const e=n.function||{};if((e.name||"").toLowerCase()===t)return safeParseJSON(e.arguments)}return null}function getRouterHandled(e,t){if(!e||!Array.isArray(e.handled))return null;for(const n of e.handled)if(n&&(n.tag||"").toLowerCase()===t)return n;return null}function applyDebugOps(e){e.forEach(e=>{if("debug"===e.tag&&e.json&&"string"==typeof e.json.op){const t=e.json.op.toLowerCase();"on"===t?(document.documentElement.setAttribute("data-debug","on"),addBubble("sys","Debug mode ON")):"off"===t&&(document.documentElement.setAttribute("data-debug","off"),addBubble("sys","Debug mode OFF"))}})}function applyDebugOpsFrom(e,t){const n=getToolFnArgs(e,"debug");let i=n&&"string"==typeof n.op?n.op.toLowerCase():null;if(!i){const e=getRouterHandled(t,"debug");e&&e.payload&&"string"==typeof e.payload&&(i=e.payload.toLowerCase())}i&&("on"===i?(document.documentElement.setAttribute("data-debug","on"),addBubble("sys","Debug mode ON")):"off"===i&&(document.documentElement.setAttribute("data-debug","off"),addBubble("sys","Debug mode OFF")))}function extractInterestFrom(e,t){let n=getToolFnArgs(e,"interest");if(!n){const e=getRouterHandled(t,"interest");e&&e.payload&&"object"==typeof e.payload&&(n=e.payload)}if(!n)return null;const i=Number(n.confidence);return isFinite(i)?{topics:Array.isArray(n.topics)?n.topics.slice(0,4):[],reason:"string"==typeof n.reason?n.reason:"",confidence:Math.max(0,Math.min(1,i))}:null}function resolveInterest(e,t,n){const i=extractInterestFrom(t,n);if(i&&(i.topics.length||i.reason))return i;const o=extractInterest(e);return o&&(o.topics.length||o.reason)?o:null}function tailRole(){return history.length?history[history.length-1].role:""}function handleKeyboardToggle(e){e!==_kbPrev&&(_kbPrev=e,isKeyboardOpen=e,e?(pendingTimer&&(clearTimeout(pendingTimer),pendingTimer=null),typingTimer&&(clearTimeout(typingTimer),typingTimer=null,typingETA=0),clearPending(),pendingTextEl.textContent="Idle (keyboard open)",updatePendingText()):inFlight||"user"!==tailRole()?updatePendingText():scheduleTurn())}pendingEl.classList.add("on"),updatePendingText(),setInterval(updatePendingText,500),function(){const e=document.documentElement,t=window.visualViewport;function n(){const n=Math.abs(chat.scrollHeight-chat.scrollTop-chat.clientHeight)<2,i=chat.scrollTop,o=t?t.height:window.innerHeight,r=t?t.offsetTop:0;e.style.setProperty("--app-h",o+"px"),e.style.setProperty("--vv-top",r+"px");const s=imeOpen(),a=e.classList.contains("ime-open");e.classList.toggle("ime-open",s),s!==a&&(handleKeyboardToggle(s),s&&!a&&requestAnimationFrame(()=>{chat.scrollTop=i})),!s&&n&&(chat.scrollTop=chat.scrollHeight)}n(),t?.addEventListener("resize",n),t?.addEventListener?.("geometrychange",n),window.addEventListener("orientationchange",n)}(),sys("New session started"),btn.addEventListener("click",sendMessage),box.addEventListener("keydown",e=>{229!==e.keyCode?"Enter"!==e.key||e.shiftKey||(e.preventDefault(),sendMessage()):rearmTypingGrace()}),box.addEventListener("focus",()=>{imeOpen()?handleKeyboardToggle(!0):(pendingTimer&&(clearTimeout(pendingTimer),pendingTimer=null),clearPending(),typingTimer&&(clearTimeout(typingTimer),typingTimer=null,typingETA=0),typingETA=Date.now()+typingIdleMs,typingTimer=setTimeout(()=>{typingTimer=null,typingETA=0,inFlight||"user"!==tailRole()?updatePendingText():scheduleTurn()},typingIdleMs),updatePendingText())}),box.addEventListener("input",e=>{const t=box.value.trim().length>0;e.isComposing||isComposing||t?rearmTypingGrace():(pendingTimer&&(clearTimeout(pendingTimer),pendingTimer=null),clearPending(),typingTimer&&(clearTimeout(typingTimer),typingTimer=null,typingETA=0),t?(typingETA=Date.now()+typingIdleMs,typingTimer=setTimeout(()=>{typingTimer=null,typingETA=0,inFlight||"user"!==tailRole()?updatePendingText():scheduleTurn()},typingIdleMs)):inFlight||"user"!==tailRole()||scheduleTurn())}),box.addEventListener("blur",()=>{typingTimer&&(clearTimeout(typingTimer),typingTimer=null,typingETA=0,updatePendingText()),!inFlight&&!pendingTimer&&queuedCount>lastTurnQueuedCount&&scheduleTurn()}),box.addEventListener("compositionstart",()=>{isComposing=!0,handleKeyboardToggle(!0)}),box.addEventListener("compositionend",()=>{isComposing=!1}),box.addEventListener("touchstart",()=>{IS_TOUCH&&rearmTypingGrace()},{passive:!0}),box.addEventListener("compositionupdate",()=>{rearmTypingGrace()});</script>
+<!doctype html>
+<html lang="en" data-debug="off" compact="off">
+<head>
+<meta charset="utf-8">
+<title>M.ICU - Eunoia</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<style>
+:root { --bg:#0b0c0f; --panel:#11141a; --muted:#9aa0aa; --fg:#e9eef4; --accent:#5aa1ff; --border:#1c2230; }
+*{box-sizing:border-box}
+/* lock the page; only .chat scrolls */
+html, body { height: 100%; overflow: hidden; overscroll-behavior: none; overflow-anchor: none; }
+/* avoid seeing “no background” outside the body during rubber-banding */
+html { background: #0b0c0f; }
+
+/* pin the app to the visual viewport and follow its top offset */
+/* replace the existing .wrap style */
+.wrap { 
+  position: fixed; 
+  inset: 0; 
+  /*height: var(--app-h, 100svh);*/
+  height: 100svh;
+}
+
+/* give the chat space when the keyboard is open */
+.chat { padding-bottom: calc(18px + var(--kb, 0px)); }
+
+/* keep the inputbar above the home indicator */
+.inputbar { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+
+html,body{}
+body{
+  margin:0;
+  background:linear-gradient(180deg,#0b0c0f,#0d1117);
+  font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;
+  color:var(--fg);
+  overflow:hidden;
+}
+.wrap{
+  max-width:860px;
+  margin:0 auto;
+  padding:0 14px;
+  /*height:var(--app-h, 100dvh);*/
+  height: 100svh;
+  display:flex;
+}
+.card{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:16px;
+  box-shadow:0 10px 30px rgba(0,0,0,.25);
+
+  display:grid;
+  grid-template-rows:auto auto 1fr auto auto;
+  height:100%;
+  width:100%;
+  overflow:hidden;
+}
+header{
+  padding:16px 18px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  justify-content:space-between;
+  align-items:center
+}
+h1{margin:0;font-size:16px;letter-spacing:.2px}
+.meta{color:var(--muted);font-size:12px}
+.chat{
+  overflow:auto;
+  padding:18px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain;
+}
+.msg{max-width:80%;padding:12px 14px;border-radius:12px;white-space:pre-wrap}
+.user{align-self:flex-end;background:#1b2230;border:1px solid #2a3145}
+.assistant{align-self:flex-start;background:#0f1218;border:1px solid #1f2738}
+.sys{align-self:center;color:var(--muted);font-size:12px;line-height:1.2;margin:0;padding:0}
+.inputbar{
+  display:flex;
+  gap:10px;
+  padding:12px 16px;
+  border-top:1px solid var(--border);
+  background:var(--panel);
+}
+textarea{
+  flex:1;
+  min-height:68px;
+  max-height:160px;
+  padding:10px;
+  background:#0f1218;
+  border:1px solid var(--border);
+  border-radius:10px;
+  color:var(--fg);
+  resize:vertical;
+  font:inherit
+}
+button{
+  background:var(--accent);
+  color:#071120;
+  border:0;
+  border-radius:10px;
+  padding:10px 16px;
+  font:600 14px/1 system-ui;
+  cursor:pointer
+}
+button:hover{filter:brightness(1.05)}
+.small{
+  font-size:12px;
+  color:var(--muted);
+  padding:0 16px 12px;
+  background:var(--panel);
+}
+.pending{
+  font-size:12px;
+  color:var(--muted);
+  display:grid;grid-template-columns:auto 1fr;align-items:start;gap:6px 16px;
+  background:var(--panel);
+  padding: 0px 6px;
+}
+.pending.on{display:block}
+.pending .dot{
+  display:inline-block;
+  width:6px;
+  height:6px;
+  border-radius:50%;
+  background:var(--accent);
+  margin-right:6px;
+  animation:blink 1s infinite
+}
+.pending .vars{
+  margin-top:2px;
+  font-size:11px;
+  color:#666;
+  white-space:pre-line; 
+}
+.pending .status{display:flex;align-items:center;gap:6px}
+.pending .vars{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:4px 12px;
+  font:11px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color:#8a94a6;
+  white-space:normal;               /* was pre-line */
+}
+.pending .kv{display:flex;justify-content:space-between;gap:8px}
+.pending .k{opacity:.75}
+.pending .v{text-align:right}
+@keyframes blink{0%,100%{opacity:.3}50%{opacity:1}}
+
+/* Debug-off: hide pending contents and squeeze the bar to a slim spacer */
+:root[data-debug="off"] #pending .dot,
+:root[data-debug="off"] #pending #pendingText,
+:root[data-debug="off"] #pending .vars {
+  visibility: hidden; /* keep layout without showing content */
+}
+:root[data-debug="off"] #pending {
+  padding: 2px 16px;     /* slimmer vertical space */
+  min-height: 6px;       /* technical placeholder height */
+  line-height: 0;        /* avoid accidental text height */
+  border-bottom-color: transparent; /* visually unobtrusive */
+  background: var(--panel);         /* consistent with card */
+}
+/* optional: during IME, squeeze non-essential bars to gain a bit more space */
+html.ime-open #pending{ padding: 2px 16px; }
+/*html.ime-open .small{ display:none; }*/
+html.ime-open body {
+  overflow: hidden;  
+}
+
+/* add to existing styles */
+html.ime-open .chat {
+  scroll-behavior: auto; /* disable smooth scrolling during keyboard */
+}
+
+/* prevent body scroll entirely when keyboard is open */
+html.ime-open {
+  position: fixed;
+  width: 100%;
+}
+
+/* Compact mode */
+:root[compact="on"] .chat { gap:6px; padding:12px; }
+:root[compact="on"] .msg { max-width:86%; padding:6px 8px; border-radius:8px; font-size:13px; line-height:1.25; }
+:root[compact="on"] .sys { font-size:11px; }
+:root[compact="on"] header { padding:10px 12px; }
+:root[compact="on"] h1 { font-size:14px; }
+:root[compact="on"] .small { font-size:11px; padding:0 12px 8px; }
+:root[compact="on"] .pending { padding:0 6px; }
+:root[compact="on"] textarea { min-height:48px; padding:8px; font-size:14px; }
+:root[compact="on"] .inputbar { padding:8px 12px; gap:8px; }
+:root[compact="on"] button { padding:8px 12px; font-size:13px; border-radius:8px; }
+
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <header>
+      <h1>Eunoia</h1>
+      <div class="meta">Session history is in-page only</div>
+    </header>
+
+    <div id="pending" class="pending" aria-live="polite">
+      <div class="status"><span class="dot"></span><span id="pendingText">Waiting…</span></div>
+      <div id="pendingVars" class="vars"></div>
+    </div>
+
+
+    <div id="chat" class="chat">
+      <!--<div class="msg sys">New session started</div>-->
+    </div>
+
+    <div class="inputbar">
+      <textarea id="box" placeholder="Type a message..."></textarea>
+      <button id="send">Send</button>
+    </div>
+    <div class="small">Key: <?=htmlspecialchars(OPENAI_KEY_PATH)?> | Endpoint: <?=htmlspecialchars(OPENAI_API_URL)?> | Model: <?=htmlspecialchars(OPENAI_MODEL)?></div>
+  </div>
+</div>
+
+<script id='hist-data' type='application/json'>
+<?= json_encode(fetch_last_messages(ensure_session(), HISTORY_LINES), JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>
+</script>
+
+<script>
+const chat = document.getElementById('chat');
+const box  = document.getElementById('box');
+const btn  = document.getElementById('send');
+const pendingEl = document.getElementById('pending');
+const pendingTextEl = document.getElementById('pendingText');
+const MAX_CHAIN = 3;
+const KB_EPS = 24;
+
+const IS_LIKELY_IOS = /iP(hone|ad|od)/i.test(navigator.userAgent) ||
+                      (/Mac/i.test(navigator.userAgent) && 'ontouchend' in document);
+const IS_TOUCH = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+
+// in-page history only
+const history = [];
+let inFlight = false;
+
+// user msg buffering
+let debounceMs = 1500;
+let pendingTimer = null;  
+let pendingTick = null;   
+let pendingETA = 0; 
+let queuedCount = 0;
+let lastTurnQueuedCount = 0;
+let isComposing = false;
+let isKeyboardOpen = false;
+let _kbPrev = false;
+
+let typingTimer = null;
+let typingIdleMs = 6000;
+let typingInitMs = 1800;
+let typingETA = 0;
+
+let lineInterval = 2001;
+
+pendingEl.classList.add('on'); 
+updatePendingText();
+setInterval(updatePendingText, 500);
+
+function rearmTypingGrace(){
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  clearPending();
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
+  typingETA = Date.now() + typingIdleMs;
+  typingTimer = setTimeout(() => {
+    typingTimer = null; typingETA = 0;
+    if (!inFlight && tailRole() === 'user') scheduleTurn();
+    else updatePendingText();
+  }, typingIdleMs);
+  updatePendingText();
+}
+
+function imeOpen(){
+  if (isComposing) return true;
+  const focused = document.activeElement === box;
+  if (!focused) return false;
+
+  const vv = window.visualViewport;
+  if (vv){
+    const occluded = window.innerHeight - (vv.height + vv.offsetTop);
+    if (occluded > KB_EPS) return true;
+  }
+
+  return IS_LIKELY_IOS && focused;
+}
+
+(function(){
+  const root = document.documentElement;
+  const vv = window.visualViewport;
+
+  let resizeTimeout;
+  function debouncedSetAppHeight() {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(setAppHeight, 10);
+  }
+
+  function setAppHeight(){
+    const wasAtBottom = Math.abs(chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 2;
+    const prevScrollTop = chat.scrollTop;
+    
+    const vh   = vv ? vv.height : window.innerHeight;
+    const vTop = vv ? vv.offsetTop : 0;
+    root.style.setProperty('--app-h', vh + 'px');
+    root.style.setProperty('--vv-top', vTop + 'px');
+
+    const kbOpen = imeOpen();
+    const wasKbOpen = root.classList.contains('ime-open');
+    root.classList.toggle('ime-open', kbOpen);
+    
+    if (kbOpen !== wasKbOpen) {
+      handleKeyboardToggle(kbOpen);
+      
+      if (kbOpen && !wasKbOpen) {
+        requestAnimationFrame(() => {
+          chat.scrollTop = prevScrollTop;
+        });
+      }
+    }
+
+    if (!kbOpen && wasAtBottom) {
+      chat.scrollTop = chat.scrollHeight;
+    }
+  }
+
+  setAppHeight();
+  vv?.addEventListener('resize', setAppHeight);
+  vv?.addEventListener?.('geometrychange', setAppHeight);
+  window.addEventListener('orientationchange', setAppHeight);
+})();
+
+function debugOn(){ return document.documentElement.getAttribute('data-debug') !== 'off'; }
+function sys(msg){ if (debugOn()) addBubble('sys', msg); }
+
+function addBubble(role, text){
+  const div = document.createElement('div');
+  div.className = 'msg ' + (role==='user' ? 'user' : role==='assistant' ? 'assistant' : 'sys');
+  if (role === 'assistant') {text = renderVisible(text);}
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+// display history chats
+try {
+  const histElem = document.getElementById('hist-data');
+  if (histElem) {
+    const hist = JSON.parse(histElem.textContent || '[]');
+    hist.forEach(m => {
+      const role = m.role || 'sys';
+      const content = m.content || '';
+      if (content) {
+        parts = content.split(/\n\n+/);
+        for (let i = 0; i < parts.length; i++) {
+          addBubble(role, parts[i]); 
+        }
+      }
+    });
+  }
+} catch (e) {
+  console.error('Failed parsing history', e);
+}
+
+sys('New session started')
+
+function showPending(ms){
+  pendingETA = Date.now() + ms;
+  pendingEl.classList.add('on');
+  updatePendingText();
+}
+
+function clearPending(){
+  pendingETA = 0;
+  if (pendingTick) { clearInterval(pendingTick); pendingTick = null; }
+  pendingTextEl.textContent = 'Idle';
+  updatePendingText();
+}
+
+function esc(s){return String(s).replace(/[&<>"']/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]))}
+
+function setVars(obj){
+  const el = document.getElementById('pendingVars');
+  if (document.documentElement.getAttribute('data-debug') === 'off'){ el.innerHTML=''; return; }
+  el.innerHTML = Object.entries(obj).map(([k,v]) =>
+    `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`
+  ).join('');
+}
+
+function updatePendingText(){
+  const hasTimer = !!pendingTimer;
+  const hasTyping = !!typingTimer;
+
+  if (inFlight) {
+    pendingTextEl.textContent = 'Sending…';
+  } else if (hasTimer) {
+    const left = Math.max(0, pendingETA - Date.now());
+    pendingTextEl.textContent = `Pending send in ${(left/1000).toFixed(1)}s`;
+  } else if (hasTyping) {
+    const tleft = Math.max(0, typingETA - Date.now());
+    const mode = (box === document.activeElement
+                    ? (box.value.trim() ? 'typing grace' : 'focus grace')
+                    : 'typing grace');
+    pendingTextEl.textContent = `${mode} ${(tleft/1000).toFixed(1)}s`;
+  } else if (isComposing) {
+    pendingTextEl.textContent = 'IME composing';
+  } else if (imeOpen()) {
+    pendingTextEl.textContent = 'Idle (keyboard open)';
+  } else {
+    const suffix = (tailRole() === 'assistant') ? ' (awaiting user)' : '';
+    pendingTextEl.textContent = 'Idle' + suffix;
+  }
+
+  const varsEl = document.getElementById('pendingVars');
+  if (document.documentElement.getAttribute('data-debug') !== 'off') {
+      setVars({
+        pendingTimer: !!pendingTimer,
+        lastTurnQueuedCount,
+        inFlight,
+        queuedCount: queuedCount - lastTurnQueuedCount,
+        tailRole: tailRole(),
+        typingTimer: !!typingTimer,
+        isComposing,
+        isKeyboardOpen,
+      });
+  } else {
+    varsEl.textContent = '';
+  }
+}
+
+/* ---------- fences: parse, render, route, interest ---------- */
+function parseFencedBlocks(s){
+  const re=/~~~(\w+)\s*(\{[\s\S]*?\})\s*~~~/giu, out=[]; let m;
+  while((m=re.exec(s))){
+    try{ out.push({tag:(m[1]||'').toLowerCase(), json:JSON.parse(m[2])}); }catch{}
+  }
+  return out;
+}
+
+function stripFences(s) {
+  s = String(s || '').replace(/~~~\w+\s*\{[\s\S]*?\}\s*~~~/g, '').trim();
+  // s = s.replace(/\n{2,}/g, '\n');
+  return s;
+}
+
+function renderVisible(s){
+  s = s.replace(/(?<=\s)(?:—|–|--|-)(?=\s)/g, ', ');
+  return String(s||'')
+    .replace(/~~~action[\s\S]*?~~~\s*/g,'[ACT]')
+    .replace(/~~~memory[\s\S]*?~~~\s*/g,'[MEM]')
+    .replace(/~~~interest[\s\S]*?~~~\s*/g,'[INT]')
+    .trim();
+}
+
+async function routeBlocks(aiOutput, toolCalls){
+  const hasFences = /~~~\w+[\s\S]*?~~~/m.test(aiOutput);
+  const hasTools  = Array.isArray(toolCalls) && toolCalls.length>0;
+  if(!hasFences && !hasTools) return null;
+
+  const r = await fetch('action_router.php',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      ai_output: String(aiOutput||''),
+      tool_calls: hasTools ? toolCalls : undefined
+    }),
+    credentials:'same-origin'
+  });
+  if(!r.ok) throw new Error('router http '+r.status);
+  return await r.json();
+}
+
+function extractInterest(aiOutput){
+  const blocks=parseFencedBlocks(aiOutput);
+  let j=(blocks.find(b=>b.tag==='interest')||{}).json||null;
+  if(!j){
+    for(const b of blocks){ const o=b.json||{};
+      if(Array.isArray(o.topics)&&typeof o.confidence==='number'){ j=o; break; }
+    }
+  }
+  if(!j) return null;
+  const confidence=Math.max(0,Math.min(1,Number(j.confidence)));
+  if(!isFinite(confidence)) return null;
+  return {
+    topics:Array.isArray(j.topics)?j.topics.slice(0,4):[],
+    reason:typeof j.reason==='string'?j.reason:'',
+    confidence
+  };
+}
+
+function traceIssuedFences(aiOutput){
+  const blocks = parseFencedBlocks(aiOutput);
+  for(const b of blocks){
+    if (b.tag==='action')  sys('Action issued');
+    else if (b.tag==='memory') sys('Memory update issued');
+    else sys('Block '+b.tag+' issued');
+  }
+}
+
+function traceRouterResult(router){
+  if (!router) return;
+  const handled = Array.isArray(router.handled) ? router.handled : [];
+  const unhandled = Array.isArray(router.unhandled) ? router.unhandled : [];
+  handled.forEach(h=>{
+    if (!h) return;
+    if (h.tag==='action'){
+      const intent = h.intent || 'action';
+      const note = h.note || h.status || (h.result ? 'ok' : 'not_found');
+      addBubble('sys', 'Action '+intent+': '+note);
+    } else if (h.tag==='memory'){
+      sys('Memory '+(h.status||'ok')+(h.fact?': '+h.fact:''));
+    } else {
+      sys('Handled '+(h.tag||'block'));
+    }
+  });
+  unhandled.forEach(u=>{
+    if (!u) return;
+    addBubble('sys', 'Unhandled '+(u.tag||'block')+(u.error?': '+u.error:'')); 
+  });
+}
+
+function scheduleTurn() {
+  if (inFlight) return;
+  if (tailRole() === 'assistant'){
+    clearPending();
+    pendingTextEl.textContent = 'Idle (awaiting user)';
+    updatePendingText();
+    return;
+  }
+  if (imeOpen()) {
+    const hasText = box.value.trim().length > 0;
+    if (!hasText) {
+      typingTimer = setTimeout( performModelTurn, typingInitMs);
+      typingETA = Date.now() + typingInitMs;
+    }
+    return;
+  }
+  if (pendingTimer) clearTimeout(pendingTimer);
+  pendingTimer = setTimeout(performModelTurn, debounceMs);
+  showPending(debounceMs);
+}
+
+async function sendMessage(){
+  const q = box.value.trim();
+  if (!q) return;
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
+  addBubble('user', q);
+  box.value = '';
+  history.push({ role: 'user', content: q });
+  queuedCount++;
+
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  clearPending();
+  scheduleTurn();
+}
+
+async function performModelTurn() {
+  if (tailRole() === 'assistant'){
+    clearPending();
+    pendingTextEl.textContent = 'Idle (awaiting user)';
+    updatePendingText();
+    return;
+  }
+
+  if (inFlight) return;
+  inFlight = true;
+  btn.disabled = true;
+  clearPending();
+  const turnStartQueued = queuedCount;
+  if (lastTurnQueuedCount === queuedCount) {
+    sys('Tried to submit API req with no new msg.');
+    inFlight = false;
+    btn.disabled = false;
+    return;
+  }
+  lastTurnQueuedCount = turnStartQueued;
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; }
+
+  try{
+    const r = await fetch('', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: history })
+    });
+    const j = await r.json();
+    if (j.error){ addBubble('assistant', 'Error: ' + j.error); return; }
+
+    const ans = String(j.answer ?? '');
+    const toolCalls = Array.isArray(j.assistant_tool_calls) ? j.assistant_tool_calls : [];
+    await handleAiOutput(ans, toolCalls, 0);
+
+  } finally {
+    inFlight = false;
+    btn.disabled = false;
+
+    if (queuedCount > lastTurnQueuedCount) {
+      scheduleTurn();
+    }
+  }
+}
+
+async function handleAiOutput(aiOutput, toolCalls = [], depth = 0){
+  if (!aiOutput && !(Array.isArray(toolCalls) && toolCalls.length)) return;
+  const raw = String(aiOutput);
+  const visible = stripFences(raw) || '*command*'; // visible should be non-empty.
+
+
+  //addBubble('assistant', visible);
+  const parts = visible.split(/\n\n+/);
+  for (let i = 0; i < parts.length; i++) {
+    setTimeout(() => addBubble('assistant', parts[i]), i * lineInterval); 
+  }
+  
+  if (Array.isArray(toolCalls) && toolCalls.length){
+    history.push({ role:'assistant', content: raw, tool_calls: toolCalls });
+  } else {
+    history.push({ role:'assistant', content: raw });
+  }
+
+  traceIssuedFences(raw);
+  applyDebugOps(parseFencedBlocks(raw));
+  applyDebugOpsFrom(toolCalls, null);
+
+  let router = null;
+  try {
+    router = await routeBlocks(raw, toolCalls);
+    traceRouterResult(router);
+    applyDebugOpsFrom(toolCalls, router);
+    // push ready tool messages returned by router (API-level calls)
+    if (router) {
+      if (Array.isArray(router.tool_messages) && router.tool_messages.length > 0) {
+        for (const tm of router.tool_messages) {
+          if (!tm || typeof tm !== 'object') continue;
+          history.push({
+            role: 'tool',
+            tool_call_id: String(tm.tool_call_id || ''),
+            content: String(tm.content || '')
+          });
+        }
+      } else {
+        //history.push({ role: 'system', content: 'function result: ' + JSON.stringify(router) })
+        //history.push({ role: 'user', content: 'Continue your response with the last function result' });
+        history.push({ role: 'user', content: 'function result: ' + JSON.stringify(router) });
+      }
+    }
+  } catch (error) {
+    console.error('Router error:', error);
+    addBubble('sys', `Router error: ${error.message}`);
+  }
+
+  if (depth >= MAX_CHAIN) return;
+
+  const handled = (router && Array.isArray(router.handled)) ? router.handled : [];
+  const hasNonMemoryAction = handled.some(h => h && h.tag === 'action');
+
+  if (hasNonMemoryAction){
+    const r2 = await fetch('', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ 
+        messages: history, 
+        last_func_call: Array.isArray(toolCalls) ? toolCalls : []
+      })
+    });
+    const j2 = await r2.json();
+    if (!j2.error){
+      const toolCalls2 = Array.isArray(j2.assistant_tool_calls) ? j2.assistant_tool_calls : [];
+      await handleAiOutput(String(j2.answer ?? ''), toolCalls2, depth + 1);
+    } else {
+      addBubble('sys', 'followup_error: ' + j2.error);
+    }
+    return;
+  }
+
+  const interest = resolveInterest(raw, toolCalls, router);
+  if (interest){
+    const p = Math.max(0, Math.min(1, interest.confidence + 0.2));
+    if (Math.random() < p){
+      sys('Interest trigger p=' + p.toFixed(2) + (interest.topics.length ? (' [' + interest.topics.join(', ') + ']') : ''));
+      const r3 = await fetch('', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ 
+          messages: history,
+          last_func_call: Array.isArray(toolCalls) ? toolCalls : []
+        })
+      });
+      const j3 = await r3.json();
+      if (!j3.error){
+        const toolCalls3 = Array.isArray(j3.assistant_tool_calls) ? j3.assistant_tool_calls : [];
+        await handleAiOutput(String(j3.answer ?? ''), toolCalls3, depth + 1);
+      } else {
+        addBubble('sys', 'interest_followup_error: ' + j3.error);
+      }
+    }
+  }
+}
+
+function safeParseJSON(s){ try{ return JSON.parse(String(s||'')); }catch{ return null; } }
+
+function getToolFnArgs(toolCalls, fnName){
+  if (!Array.isArray(toolCalls)) return null;
+  for (const tc of toolCalls){
+    if (!tc || tc.type !== 'function') continue;
+    const f = tc.function || {};
+    if ((f.name||'').toLowerCase() === fnName) return safeParseJSON(f.arguments);
+  }
+  return null;
+}
+
+function getRouterHandled(router, tag){
+  if (!router || !Array.isArray(router.handled)) return null;
+  for (const h of router.handled){ if (h && (h.tag||'').toLowerCase() === tag) return h; }
+  return null;
+}
+
+
+function applyDebugOps(blocks){
+  blocks.forEach(b=>{
+    if (b.tag === 'debug' && b.json && typeof b.json.op === 'string'){
+      const op = b.json.op.toLowerCase();
+      if (op === 'on'){
+        document.documentElement.setAttribute('data-debug','on');
+        addBubble('sys','Debug mode ON');
+      } else if (op === 'off'){
+        document.documentElement.setAttribute('data-debug','off');
+        addBubble('sys','Debug mode OFF');
+      }
+    }
+  });
+}
+
+function applyDebugOpsFrom(toolCalls, router){
+  // prefer explicit tool call
+  const args = getToolFnArgs(toolCalls, 'debug');
+  let op = (args && typeof args.op === 'string') ? args.op.toLowerCase() : null;
+
+  // fallback to router-handled debug
+  if (!op){
+    const h = getRouterHandled(router, 'debug');
+    if (h && h.payload && typeof h.payload === 'string') op = h.payload.toLowerCase();
+  }
+  if (!op) return;
+
+  if (op === 'on'){
+    document.documentElement.setAttribute('data-debug','on');
+    addBubble('sys','Debug mode ON');
+  } else if (op === 'off'){
+    document.documentElement.setAttribute('data-debug','off');
+    addBubble('sys','Debug mode OFF');
+  }
+}
+
+function extractInterestFrom(toolCalls, router){
+  // prefer explicit tool call
+  let o = getToolFnArgs(toolCalls, 'interest');
+
+  // fallback to router-handled interest
+  if (!o){
+    const h = getRouterHandled(router, 'interest');
+    if (h && h.payload && typeof h.payload === 'object') o = h.payload;
+  }
+  if (!o) return null;
+
+  const conf = Number(o.confidence);
+  if (!isFinite(conf)) return null;
+  return {
+    topics: Array.isArray(o.topics) ? o.topics.slice(0,4) : [],
+    reason: typeof o.reason === 'string' ? o.reason : '',
+    confidence: Math.max(0, Math.min(1, conf))
+  };
+}
+
+function resolveInterest(aiOutput, toolCalls, router){
+  const a = extractInterestFrom(toolCalls, router);
+  if (a && (a.topics.length || a.reason)) return a;
+  const b = extractInterest(aiOutput);
+  return (b && (b.topics.length || b.reason)) ? b : null;
+}
+
+function tailRole(){ 
+  return history.length ? history[history.length-1].role : ''; 
+}
+
+function handleKeyboardToggle(open){
+  if (open === _kbPrev) return;
+  _kbPrev = open;
+  isKeyboardOpen = open;
+
+  if (open){
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (typingTimer)  { clearTimeout(typingTimer);  typingTimer  = null; typingETA = 0; }
+    clearPending();
+    pendingTextEl.textContent = 'Idle (keyboard open)';
+    updatePendingText();
+  } else {
+    if (!inFlight && tailRole() === 'user') scheduleTurn();
+    else updatePendingText();
+  }
+}
+
+btn.addEventListener('click', sendMessage);
+box.addEventListener('keydown', (e)=>{
+  if (e.keyCode === 229) {
+    rearmTypingGrace();
+    return;
+  };
+  if (e.key === 'Enter' && !e.shiftKey) {  e.preventDefault(); sendMessage(); }
+});
+box.addEventListener('focus', () => {        
+  if (imeOpen()){                            
+    handleKeyboardToggle(true);            
+    return;                                  
+  }
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  clearPending();
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
+  typingETA = Date.now() + typingIdleMs;
+  typingTimer = setTimeout(() => {
+    typingTimer = null; typingETA = 0;
+    if (!inFlight && tailRole() === 'user') scheduleTurn();
+    else updatePendingText();
+  }, typingIdleMs);
+  updatePendingText();
+});
+box.addEventListener('input', (e) => {
+  const hasText = box.value.trim().length > 0;
+  if (e.isComposing || isComposing || hasText) {
+    rearmTypingGrace();
+    return;
+  };
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  clearPending();
+
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; }
+
+  if (hasText) {
+    typingETA = Date.now() + typingIdleMs;
+    typingTimer = setTimeout(() => {
+      typingTimer = null; typingETA = 0;
+      if (!inFlight && tailRole() === 'user') {
+        scheduleTurn();
+      } else {
+        updatePendingText();
+      }
+    }, typingIdleMs);
+  } else {
+    if (!inFlight && tailRole() === 'user') scheduleTurn();
+  }
+});
+
+box.addEventListener('blur', () => {
+  if (typingTimer) { clearTimeout(typingTimer); typingTimer = null; typingETA = 0; updatePendingText(); }
+  if (!inFlight && !pendingTimer && queuedCount > lastTurnQueuedCount) scheduleTurn();
+});
+box.addEventListener('compositionstart', () => {
+  isComposing = true;
+  handleKeyboardToggle(true);
+});
+box.addEventListener('compositionend', () => {
+  isComposing = false;
+});
+
+box.addEventListener('touchstart', () => {
+  if (!IS_TOUCH) return;               
+  rearmTypingGrace();
+}, {passive:true});
+
+box.addEventListener('compositionupdate', () => {
+  rearmTypingGrace();
+});
+</script>
+
+</body>
+</html>

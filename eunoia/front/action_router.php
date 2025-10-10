@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 require_once '/var/lib/euno/lib/task-store.php';
 require_once '/var/lib/euno/lib/memory-store.php';
+require_once '/var/lib/euno/lib/dida-ops.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -55,7 +56,7 @@ function normalize_json_like(string $s): string {
 }
 
 // -- executors --
-function handle_action(array $json, TaskStore $taskStore): array {
+function handle_action(array $json, TaskStore $taskStore, ?DidaOps $dida): array {
     $intent = strtolower((string)($json['intent'] ?? ''));
     $args   = is_array($json['args'] ?? null) ? $json['args'] : [];
 
@@ -77,9 +78,9 @@ function handle_action(array $json, TaskStore $taskStore): array {
             $td = (string)($t['time']['date']  ?? '');
             $ts = (string)($t['time']['start'] ?? '');
             $te = (string)($t['time']['end']   ?? '');
-            if ($date  !== null && $td !== (string)$date)  continue;
-            if ($start !== null && $ts !== (string)$start) continue;
-            if ($end   !== null && $te !== (string)$end)   continue;
+            if ($date  !== null && $td !== '' && $td !== (string)$date)  continue;
+            if ($start !== null && $ts !== '' && $ts !== (string)$start) continue;
+            if ($end   !== null && $te !== '' && $te !== (string)$end)   continue;
             return $t;
         }
         return null;
@@ -110,6 +111,16 @@ function handle_action(array $json, TaskStore $taskStore): array {
         ];
 
         $inserted = $taskStore->upsert($task);
+
+        // sync to dida365
+        if ($dida && $inserted) {
+            $tid = $dida->create($task);
+            if ($tid) {
+                $task['updates'][] = "TID=$tid";
+                $taskStore->upsert($task);
+            }
+        }
+
         return ['tag'=>'action','intent'=>$intent,'status'=>$inserted?'inserted':'updated','result'=>$task];
     }
 
@@ -120,7 +131,7 @@ function handle_action(array $json, TaskStore $taskStore): array {
         $end   = isset($args['end'])   ? (string)$args['end']   : null;
         if ($name === '') return ['tag'=>'action','intent'=>$intent,'error'=>'missing_name'];
 
-        $existing = $findMatch($taskStore->listAll(), $name, $date, $start, $end);
+        $existing = $findMatch($taskStore->listAll(), $name, $date, null, null);//, $start, $end);
         if (!$existing) return ['tag'=>'action','intent'=>$intent,'note'=>'not_found'];
 
         // Merge fields
@@ -146,6 +157,24 @@ function handle_action(array $json, TaskStore $taskStore): array {
             )));
         }
 
+        // sync to dida365
+        if ($dida) {
+            $tid = $dida->extractTid($merged);
+            if (!$tid) {
+                $tid = $dida->findByName($name, $existing['time'] ?? null);
+            }
+            
+            if ($tid) {
+                $dida->update($tid, $merged);
+            } else {
+                // no existing remote task, create new
+                $newTid = $dida->create($merged);
+                if ($newTid) {
+                    $merged['updates'][] = "TID=$newTid";
+                }
+            }
+        }
+
         $taskStore->upsert($merged);
         return ['tag'=>'action','intent'=>$intent,'status'=>'updated','result'=>$merged];
     }
@@ -157,14 +186,52 @@ function handle_action(array $json, TaskStore $taskStore): array {
         $end   = isset($args['end'])   ? (string)$args['end']   : null;
         if ($name === '') return ['tag'=>'action','intent'=>$intent,'error'=>'missing_name'];
 
+        // find task to get TID
+        $task = $findMatch($taskStore->listAll(), $name, $date, null, null);
+        if ($task && $dida) {
+            $tid = $dida->extractTid($task);
+            if (!$tid) {
+                $tid = $dida->findByName($name, $task['time'] ?? null);
+            }
+            if ($tid) {
+                $dida->delete($tid);
+            }
+        }
+
         $ok = $taskStore->delete($name, $date, $start, $end);
         return ['tag'=>'action','intent'=>$intent,'status'=>$ok?'deleted':'not_found'];
+    }
+
+    if ($intent === 'finish_task') {
+        $name  = trim((string)($args['name']  ?? ''));
+        $date  = isset($args['date'])  ? (string)$args['date']  : null;
+        $start = isset($args['start']) ? (string)$args['start'] : null;
+        $end   = isset($args['end'])   ? (string)$args['end']   : null;
+        if ($name === '') return ['tag'=>'action','intent'=>$intent,'error'=>'missing_name'];
+
+        // find task to get TID
+        $task = $findMatch($taskStore->listAll(), $name, $date, null, null);
+        if ($task && $dida) {
+            $tid = $dida->extractTid($task);
+            if (!$tid) {
+                $tid = $dida->findByName($name, $task['time'] ?? null);
+            }
+            if ($tid) {
+                $dida->complete($tid);
+            }
+        }
+
+        $finished = $taskStore->finish($name, $date, $start, $end);
+        if ($finished === null) {
+            return ['tag'=>'action','intent'=>$intent,'status'=>'not_found'];
+        }
+        return ['tag'=>'action','intent'=>$intent,'status'=>'finished','result'=>$finished];
     }
 
     return ['tag'=>'action','intent'=>$intent,'status'=>'not_implemented'];
 }
 
-function handle_memory(array $json, MemoryStore $mem): array {
+function handle_memory_legacy(array $json, MemoryStore $mem): array {
     $op = strtolower((string)($json['op'] ?? ''));
     $fact = trim((string)($json['fact'] ?? ''));
     if ($op === 'upsert' && $fact) {
@@ -178,10 +245,27 @@ function handle_memory(array $json, MemoryStore $mem): array {
     return ['tag'=>'memory','error'=>'bad_request'];
 }
 
+function handle_memory(array $json, MemoryStore $mem): array {
+    $op   = strtolower((string)($json['op'] ?? ''));
+    $fact = trim((string)($json['fact'] ?? ''));
+    $key  = trim((string)($json['key']  ?? 'General')) ?: 'General';
+
+    if ($op === 'upsert' && $fact) {
+        $mem->remember($fact, $key);
+        return ['tag'=>'memory','status'=>'remembered','key'=>$key,'fact'=>$fact];
+    }
+    if ($op === 'delete' && $fact) {
+        $mem->forget($fact, $key);
+        return ['tag'=>'memory','status'=>'forgot','key'=>$key,'fact'=>$fact];
+    }
+    return ['tag'=>'memory','error'=>'bad_request'];
+}
+
 /* ======== processor ======= */
 
 $taskStore   = new TaskStore('/var/lib/euno/memory/tasks.json');
 $memoryStore = new MemoryStore('/var/lib/euno/memory/global.json');
+$didaOps     = DidaOps::fromFile(); // null if unavailable
 $out = ['handled'=>[], 'unhandled'=>[], 'tool_messages'=>[]];
 
 // API-level function calls
@@ -206,7 +290,7 @@ if ($toolCalls) {
 
         $res = null;
         switch (strtolower($fn)) {
-            case 'action':   $res = handle_action($json, $taskStore);   break;
+            case 'action':   $res = handle_action($json, $taskStore, $didaOps);   break;
             case 'memory':   $res = handle_memory($json, $memoryStore); break;
             case 'interest': $res = ['tag'=>'interest','payload'=>$json,'status'=>'for_server_execute']; break;
             case 'debug':    $res = ['tag'=>'debug','payload'=>$json['op']??null,'status'=>'for_server_execute']; break;
@@ -254,7 +338,7 @@ foreach ($matches as $m) {
 
     switch ($tag) {
         case 'action':
-            $out['handled'][] = handle_action($json, $taskStore);
+            $out['handled'][] = handle_action($json, $taskStore, $didaOps);
             break;
         case 'memory':
             $out['handled'][] = handle_memory($json, $memoryStore);
