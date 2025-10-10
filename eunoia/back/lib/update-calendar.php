@@ -19,6 +19,7 @@ use Google\Service\Calendar;
 require_once '/var/www/typecho/vendor/autoload.php';
 require_once '/var/lib/euno/lib/task-store.php';
 require_once '/var/lib/euno/lib/fetch-ical.php';
+require_once '/var/lib/euno/lib/fetch-dida.php';
 
 // ---------- config ----------
 const GOOGLE_CFG   = '/var/lib/euno/secrets/google/google.json';
@@ -27,6 +28,10 @@ const TASKS_PATH   = '/var/lib/euno/memory/tasks.json';
 const HORIZON_DAYS = 31;
 const DEFAULT_IMPORTANCE = 'low';
 const GMAIL_TAGS = ['calendar'];
+
+const DIDA_BASE      = 'https://dida365.com';
+const DIDA_TOKEN     = '/var/lib/euno/secrets/dida_tokens.json';
+const DIDA_TAGS      = ['dida'];
 
 // ---------- helpers ----------
 function loadGoogleCfg(): array {
@@ -306,4 +311,72 @@ if (!empty($icsFeeds)) {
         count($icsFeeds),
         HORIZON_DAYS
     );
+}
+
+// Dida365 tasks (due today or later)
+$didaInserted = 0;
+$didaUpdated  = 0;
+$archived = 0;
+try { // Dida
+    $existing = $store->listAll();
+
+    // Build TID → local task map
+    $byTid = [];
+    foreach ($existing as $et) {
+        foreach (($et['updates'] ?? []) as $u) {
+            if (preg_match('/^TID=([a-f0-9]+)$/i', trim($u), $m)) {
+                $byTid[strtolower($m[1])] = $et;
+                break;
+            }
+        }
+    }
+
+    $didaTasks = dida_fetch_upcoming();
+
+    $seenTids = [];
+    foreach ($didaTasks as $task) {
+        // Extract TID from incoming
+        $tid = null;
+        foreach (($task['updates'] ?? []) as $u) {
+            if (preg_match('/^TID=([a-f0-9]+)$/i', trim($u), $m)) { $tid = strtolower($m[1]); break; }
+        }
+
+        if ($tid) {
+            $seenTids[$tid] = true;
+
+            // If local task with same TID exists, force same composite key so upsert updates it
+            if (isset($byTid[$tid])) {
+                $local = $byTid[$tid];
+                $task['name'] = $local['name'];
+                $task['time'] = $local['time'] ?? null;
+
+                // Ensure TID line is present and unique
+                $task['updates'] = array_values(array_unique(array_merge($local['updates'] ?? [], $task['updates'] ?? [])));
+            }
+        }
+
+        $wasInsert = $store->upsert($task);
+        if ($wasInsert) { $didaInserted++; } else { $didaUpdated++; }
+    }
+
+    // Reverse check: locally visible tasks with TID not seen in Dida payload → finish+archive
+    foreach ($byTid as $tid => $lt) {
+        if (!isset($seenTids[$tid])) {
+            $date  = $lt['time']['date']  ?? null;
+            $start = $lt['time']['start'] ?? null;
+            $end   = $lt['time']['end']   ?? null;
+            $done = $store->finish($lt['name'], $date, $start, $end);
+            if ($done !== null) { $archived++; }
+        }
+    }
+
+    echo sprintf(
+        "[%s] Dida365 synced: inserted=%d updated=%d archived_missing=%d\n",
+        (new DateTimeImmutable('now'))->format('c'),
+        $didaInserted,
+        $didaUpdated,
+        $archived
+    );
+} catch (Throwable $e) {
+    fwrite(STDERR, "[Dida365] " . $e->getMessage() . PHP_EOL);
 }

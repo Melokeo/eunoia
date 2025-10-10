@@ -2,6 +2,10 @@
 declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 
+const CAP_PAST = 8;
+const CAP_PRES = 45;
+const CAP_FUT = 20;
+
 $path = '/var/lib/euno/memory/tasks.json';
 // safe read with lock + retries
 if (! function_exists('load_json_safe')) {
@@ -31,7 +35,7 @@ if (! function_exists('load_json_safe')) {
 
             $data = json_decode($raw, true);
             if (is_array($data)) { 
-                error_log("[ctx] ok path=" . $rp . " size=$len");
+                //error_log("[ctx] ok path=" . $rp . " size=$len");
                 return $data;
             }
 
@@ -94,25 +98,32 @@ foreach ($tasks as $t) {
 }
 
 // compressors
-$fmt = fn($t) => trim(
-    (isset($t['importance']) && $t['importance'] !== '' ? '['.$t['importance'].'] ' : '') .
-    ($t['name'] ?? '(no name)') . ' - ' .
-    (($t['time']['date'] ?? 'no time') .
-     (isset($t['time']['start']) ? ' '.$t['time']['start'] .
-        (isset($t['time']['end']) ? '-'.$t['time']['end'] : '') : ''))
-);
+$fmt = function($t) {
+    $tm = $t['time'] ?? [];
+    $d = $tm['date'] ?? null;
+    $s = $tm['start'] ?? null;
+    $e = $tm['end'] ?? null;
+    
+    $time_part = $d ? $d : 'no-date';
+    if ($s) $time_part .= ' ' . $s . ($e ? '-' . $e : '');
+    $time_part .= $d ? ' (' . (new DateTimeImmutable($d))->format('D') . ')' : '';
+    
+    $imp = isset($t['importance']) && $t['importance'] !== '' ? '(' . $t['importance'] . ') ' : '';
+    
+    return '[' . $time_part . '] ' . $imp . ($t['name'] ?? '(no name)');
+};
 
 
 $lines = [];
 $lines[] = 'Task context policy: past & future, names only; present(in 15d) full info.';
 if ($past) {
     $lines[] = 'Past:';
-    foreach (array_slice($past, 0, 8) as $t) $lines[] = '- ' . ($t['name'] ?? '(no name)');
+    foreach (array_slice($past, 0, CAP_PAST) as $t) $lines[] = '- ' . ($t['name'] ?? '(no name)');
 }
 if ($present) {
     if ($past) $lines[] = '';
     $lines[] = 'Present (next 15 days):';
-    foreach (array_slice($present, 0, 10) as $t) {
+    foreach (array_slice($present, 0, CAP_PRES) as $t) {
         $updates = $t['updates'] ?? [];
         $u = $updates ? ' Updates: ' . implode('; ', array_slice($updates, -2)) : '';
         $lines[] = '- ' . $fmt($t) . $u;
@@ -121,7 +132,7 @@ if ($present) {
 if ($future) {
     if ($present) $lines[] = '';
     $lines[] = 'Future:';
-    foreach (array_slice($future, 0, 8) as $t) $lines[] = '- ' . ($t['name'] ?? '(no name)');
+    foreach (array_slice($future, 0, CAP_FUT) as $t) $lines[] = '- ' . ($t['name'] ?? '(no name)');
 }
 
 echo json_encode(['context' => $lines[0] . "\n```" . implode("\n", array_slice($lines, 1)) . '```'], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);

@@ -18,6 +18,7 @@ declare(strict_types=1);
 final class TaskStore
 {
     private string $path;
+    private string $finishedPath;
 
     public function __construct(string $path = '/var/lib/euno/memory/tasks.json')
     {
@@ -30,6 +31,13 @@ final class TaskStore
             file_put_contents($path, json_encode(['tasks' => []], JSON_PRETTY_PRINT));
             chmod($path, 0600);
         }
+
+        $this->finishedPath = dirname($path) . '/tasks-archived.json';
+        if (!file_exists($this->finishedPath)) {
+            file_put_contents($this->finishedPath, json_encode(['finished' => []], JSON_PRETTY_PRINT));
+            chmod($this->finishedPath, 0600);
+        }
+
     }
 
     /** @return array{tasks:list<array>} */
@@ -78,40 +86,60 @@ final class TaskStore
     }
 
     /** Find by exact name (case-insensitive). Optional date filter (YYYY-MM-DD). */
+    /** Backward-compat exact name (+optional date). */
     public function findByName(string $name, ?string $date = null): ?array
     {
-        $n = mb_strtolower(trim($name));
-        foreach ($this->listAll() as $t) {
-            if (mb_strtolower((string)($t['name'] ?? '')) !== $n) continue;
-            if ($date !== null) {
-                $d = $t['time']['date'] ?? null;
-                if ($d !== $date) continue;
-            }
-            return $t;
-        }
-        return null;
+        return $this->find($name, $date, null, null);
     }
 
     /** Append a single update line to a matching task; returns true if written. */
     public function appendUpdate(string $name, ?string $date, string $note): bool
     {
         $data = $this->loadAll();
-        $n = mb_strtolower(trim($name));
-        foreach ($data['tasks'] as $i => $t) {
-            if (mb_strtolower((string)($t['name'] ?? '')) !== $n) continue;
-            if ($date !== null && (($t['time']['date'] ?? null) !== $date)) continue;
+        $i = $this->locateFirst($data['tasks'], $name, $date, null, null);
+        if ($i === null) return false;
 
-            $u = $t['updates'] ?? [];
-            $u[] = $note;
-            $u = array_values(array_unique(array_filter(array_map('strval', $u))));
-            $data['tasks'][$i]['updates'] = $u;
-            $this->saveAll($data);
-            return true;
-        }
-        return false;
+        $u = $data['tasks'][$i]['updates'] ?? [];
+        $u[] = $note;
+        $u = array_values(array_unique(array_filter(array_map('strval', $u))));
+        $data['tasks'][$i]['updates'] = $u;
+        $this->saveAll($data);
+        return true;
     }
 
     // ---------- internals ----------
+    /** Canonical matcher for a task against name/date/start/end. */
+    private function taskMatches(array $t, string $name, ?string $date, ?string $start, ?string $end): bool
+    {
+        $nWant  = mb_strtolower(trim($name));
+        $nHave  = mb_strtolower((string)($t['name'] ?? ''));
+
+        $tdate  = (string)($t['time']['date']  ?? '');
+        $tstart = (string)($t['time']['start'] ?? '');
+        $tend   = (string)($t['time']['end']   ?? '');
+
+        return ($nHave === $nWant)
+            && ($date  === null || $tdate  === (string)$date)
+            && ($start === null || $tstart === (string)$start)
+            && ($end   === null || $tend   === (string)$end);
+    }
+
+    /** Locate first index matching the composite query; returns index or null. */
+    private function locateFirst(array $tasks, string $name, ?string $date, ?string $start, ?string $end): ?int
+    {
+        foreach ($tasks as $i => $t) {
+            if ($this->taskMatches($t, $name, $date, $start, $end)) return $i;
+        }
+        return null;
+    }
+
+    /** Find first matching task; null if none. */
+    public function find(string $name, ?string $date = null, ?string $start = null, ?string $end = null): ?array
+    {
+        $data = $this->loadAll();
+        $i = $this->locateFirst($data['tasks'], $name, $date, $start, $end);
+        return $i === null ? null : $data['tasks'][$i];
+    }
 
     /** @param array{tasks:list<array>} $data */
     private function saveAll(array $data): void
@@ -172,21 +200,15 @@ final class TaskStore
     {
         $data = $this->loadAll();
         $n = mb_strtolower(trim($name));
+        
         $removed = 0;
-
         $keep = [];
         foreach ($data['tasks'] as $t) {
-            $tname  = mb_strtolower((string)($t['name'] ?? ''));
-            $tdate  = (string)($t['time']['date']  ?? '');
-            $tstart = (string)($t['time']['start'] ?? '');
-            $tend   = (string)($t['time']['end']   ?? '');
-
-            $match = ($tname === $n)
-                  && ($date  === null || $tdate  === (string)$date)
-                  && ($start === null || $tstart === (string)$start)
-                  && ($end   === null || $tend   === (string)$end);
-
-            if ($match) { $removed++; } else { $keep[] = $t; }
+            if ($this->taskMatches($t, $name, $date, $start, $end)) {
+                $removed++;
+            } else {
+                $keep[] = $t;
+            }
         }
 
         if ($removed > 0) {
@@ -195,4 +217,48 @@ final class TaskStore
         }
         return false;
     }
+
+    /** Pop one task by name(+optional date/start/end). Remove it and return the task; null if not found. */
+    public function pop(string $name, ?string $date = null, ?string $start = null, ?string $end = null): ?array
+    {
+        $data = $this->loadAll();
+        $i = $this->locateFirst($data['tasks'], $name, $date, $start, $end);
+        if ($i === null) return null;
+
+        $removed = $data['tasks'][$i];
+        unset($data['tasks'][$i]);
+        $data['tasks'] = array_values($data['tasks']);
+        $this->saveAll($data);
+        return $removed;
+    }
+
+    /** Finish a task: pop it from active list and archive into finished.json. */
+    public function finish(string $name, ?string $date = null, ?string $start = null, ?string $end = null): ?array
+    {
+        $removed = $this->pop($name, $date, $start, $end);
+        if ($removed === null) return null;
+
+        // archive to finished.json
+        $fp = fopen($this->finishedPath, 'c+');
+        if (!$fp) throw new \RuntimeException('Unable to write finished file');
+        flock($fp, LOCK_EX);
+        $raw = stream_get_contents($fp);
+        $data = json_decode($raw ?: '{"finished":[]}', true);
+        if (!is_array($data) || !isset($data['finished']) || !is_array($data['finished'])) {
+            $data = ['finished' => []];
+        }
+        $data['finished'][] = $removed;
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT));
+        fflush($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        chmod($this->finishedPath, 0600);
+
+        return $removed;
+    }
+
+
+
 }
