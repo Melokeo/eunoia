@@ -1,0 +1,379 @@
+:root {
+  --bg: #0b0c0f;
+  --panel: #11141a;
+  --muted: #9aa0aa;
+  --fg: #e9eef4;
+  --accent: #5aa1ff;
+  --border: #1c2230;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* lock the page; only .chat scrolls */
+html, body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  overflow-anchor: none;
+}
+
+/* avoid seeing "no background" outside the body during rubber-banding */
+html {
+  background: #0b0c0f;
+}
+
+/* pin the app to the visual viewport and follow its top offset */
+.wrap {
+  position: fixed;
+  inset: 0;
+  height: 100svh;
+}
+
+/* give the chat space when the keyboard is open */
+.chat {
+  padding-bottom: calc(18px + var(--kb, 0px));
+}
+
+/* keep the inputbar above the home indicator */
+.inputbar {
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(180deg, #0b0c0f, #0d1117);
+  font-family: Inter, system-ui, Segoe UI, Roboto, Arial, sans-serif;
+  color: var(--fg);
+  overflow: hidden;
+}
+
+.wrap {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 0 0px;
+  height: 100svh;
+  display: flex;
+  background: url('/usr/uploads/pic/IMG_2361.jpg') center/cover fixed;
+}
+
+.card {
+  background: rgba(17, 20, 26, 0.6);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .25);
+  display: grid;
+  grid-template-rows: auto auto 1fr auto auto;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+header {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+h1 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: .2px;
+}
+
+.meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat {
+  overflow: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  /*gap: 8px;*/
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+}
+
+.msg-row {
+  display: grid;
+  grid-template-columns: 40px 1fr 40px;
+  gap: 10px;
+  align-items: start;
+}
+.msg-row + .msg-row {
+  margin-top: 8px;
+}
+
+.avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.msg {
+  padding: 12px 12px;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  grid-column: 2;
+  max-width: fit-content;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+.user {
+  background: #1b2230;
+  border: 1px solid #2a3145;
+  justify-self: end;
+}
+
+.user-avatar {
+  grid-column: 3;
+}
+
+.assistant {
+  background: #0f1218;
+  border: 1px solid #1f2738;
+  justify-self: start;
+}
+
+.assistant-avatar {
+  grid-column: 1;
+}
+
+.sys {
+  grid-column: 2;
+  justify-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+  margin: 0;
+  padding: 0;
+}
+.inputbar {
+  display: flex;
+  gap: 10px;
+  padding: 12px;  /* reduced from 12px 16px */
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+textarea {
+  flex: 1;
+  min-height: 68px;
+  max-height: 160px;
+  padding: 10px;
+  background: #0f1218;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--fg);
+  resize: vertical;
+  font: inherit;
+}
+
+button {
+  background: var(--accent);
+  color: #071120;
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 16px;
+  font: 600 14px/1 system-ui;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.05);
+}
+
+.small {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 12px 12px;  /* reduced from 0 16px 12px */
+  background: var(--panel);
+}
+
+.pending {
+  font-size: 12px;
+  color: var(--muted);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 6px 16px;
+  background: var(--panel);
+  padding: 0 6px;
+}
+
+.pending.on {
+  display: block;
+}
+
+.pending .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 6px;
+  animation: blink 1s infinite;
+}
+
+.pending .vars {
+  margin-top: 2px;
+  font-size: 11px;
+  color: #666;
+  white-space: pre-line;
+}
+
+.pending .status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pending .vars {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 4px 12px;
+  font: 11px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #8a94a6;
+  white-space: normal;
+}
+
+.pending .kv {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pending .k {
+  opacity: .75;
+}
+
+.pending .v {
+  text-align: right;
+}
+
+@keyframes blink {
+  0%, 100% {
+    opacity: .3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes floatUp {
+  from {
+    opacity: 0.3;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.msg-row.new-message {
+  animation: floatUp 0.15s ease-out forwards;
+}
+
+/* debug-off: hide pending contents and squeeze the bar to a slim spacer */
+:root[data-debug="off"] #pending .dot,
+:root[data-debug="off"] #pending #pendingText,
+:root[data-debug="off"] #pending .vars {
+  visibility: hidden;
+}
+
+:root[data-debug="off"] #pending {
+  padding: 2px 16px;
+  min-height: 6px;
+  line-height: 0;
+  border-bottom-color: transparent;
+  background: var(--panel);
+}
+
+/* optional: during IME, squeeze non-essential bars to gain a bit more space */
+html.ime-open #pending {
+  padding: 2px 16px;
+}
+
+html.ime-open body {
+  overflow: hidden;
+}
+
+html.ime-open .chat {
+  scroll-behavior: auto;
+}
+
+/* prevent body scroll entirely when keyboard is open */
+html.ime-open {
+  position: fixed;
+  width: 100%;
+}
+
+/* compact mode */
+/* compact mode */
+:root[compact="on"] .chat {
+  gap: 6px;
+  padding: 12px;
+}
+
+:root[compact="on"] .msg-row {
+  gap: 8px;
+}
+
+:root[compact="on"] .avatar {
+  width: 32px;
+  height: 32px;
+}
+
+:root[compact="on"] .msg {
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+:root[compact="on"] .sys {
+  font-size: 11px;
+}
+
+:root[compact="on"] header {
+  padding: 10px 12px;
+}
+
+:root[compact="on"] h1 {
+  font-size: 14px;
+}
+
+:root[compact="on"] .small {
+  font-size: 11px;
+  padding: 0 12px 8px;
+}
+
+:root[compact="on"] .pending {
+  padding: 0 6px;
+}
+
+:root[compact="on"] textarea {
+  min-height: 48px;
+  padding: 8px;
+  font-size: 14px;
+}
+
+:root[compact="on"] .inputbar {
+  padding: 8px 12px;
+  gap: 8px;
+}
+
+:root[compact="on"] button {
+  padding: 8px 12px;
+  font-size: 13px;
+  border-radius: 8px;
+}
