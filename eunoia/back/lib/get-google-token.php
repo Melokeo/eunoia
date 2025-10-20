@@ -1,41 +1,58 @@
 <?php
 declare(strict_types=1);
 
+http_response_code(403);
+exit;
+
 require_once '/var/www/typecho/vendor/autoload.php';
 
 use Google\Client;
 use Google\Service\Calendar;
 
-const CREDENTIALS = '/var/lib/euno/secrets/google/client_secret_1007975332091-plrhd7tndgj42c9eedrh3rq78rmk20bj.apps.googleusercontent.com.json';
+const CREDENTIALS = '/var/lib/euno/secrets/google/client_secret_759723851630-kmu385eeqjaj3siomf7ieb9jnbesq6g0.apps.googleusercontent.com.json';
 const TOKEN_FILE  = '/var/lib/euno/secrets/google/token.json';
+const REDIRECT_URI = 'https://melokeo.icu/eunoia/google_oauth.php'; // must exactly match in Google Console
 
-if (!is_file(CREDENTIALS)) {
-    fwrite(STDERR, "Missing credentials: " . CREDENTIALS . PHP_EOL);
-    exit(1);
-}
+ini_set('session.cookie_secure','1');
+ini_set('session.cookie_httponly','1');
+ini_set('session.cookie_samesite','Lax'); // Strict breaks Google callback
+session_start();
+
+if (!is_file(CREDENTIALS)) { http_response_code(500); exit('missing credentials'); }
 
 $client = new Client();
 $client->setApplicationName('Calendar Sync Init');
 $client->setScopes([Calendar::CALENDAR_READONLY]);
+$client->setAccessType('offline');   // obtain refresh_token
+$client->setPrompt('consent');       // ensure refresh_token on first grant
+$client->setIncludeGrantedScopes(true);
+$client->setRedirectUri(REDIRECT_URI);
 $client->setAuthConfig(CREDENTIALS);
-$client->setAccessType('offline');     // needed for refresh_token
-$client->setPrompt('consent');         // force issuing refresh_token on first consent
 
-$authUrl = $client->createAuthUrl();
-echo "Open this URL in a browser:\n$authUrl\n\n";
-echo "Enter the authorization code here: ";
-$authCode = trim(fgets(STDIN));
+$code  = $_GET['code']  ?? null;
+$error = $_GET['error'] ?? null;
 
-$accessToken = $client->fetchAccessTokenWithAuthCode($authCode);
-if (isset($accessToken['error'])) {
-    fwrite(STDERR, "Auth error: " . $accessToken['error'] . PHP_EOL);
-    exit(2);
+if ($error) { http_response_code(400); exit("auth error: ".htmlspecialchars($error)); }
+
+if (!$code) {
+    $state = bin2hex(random_bytes(16));
+    $_SESSION['oauth_state'] = $state;
+    $client->setState($state);
+    $authUrl = $client->createAuthUrl();
+
+    header('Location: ' . $authUrl);
+    exit;
 }
 
-if (!is_dir(dirname(TOKEN_FILE))) {
-    mkdir(dirname(TOKEN_FILE), 0700, true);
-}
-file_put_contents(TOKEN_FILE, json_encode($accessToken, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-chmod(TOKEN_FILE, 0600);
+if (($_GET['state'] ?? '') !== ($_SESSION['oauth_state'] ?? '')) { http_response_code(400); exit('invalid state'); }
+unset($_SESSION['oauth_state']);
 
-echo "Token stored at " . TOKEN_FILE . PHP_EOL;
+$token = $client->fetchAccessTokenWithAuthCode($code);
+if (isset($token['error'])) { http_response_code(400); exit($token['error']); }
+
+if (!is_dir(dirname(TOKEN_FILE))) mkdir(dirname(TOKEN_FILE), 0700, true);
+file_put_contents(TOKEN_FILE, json_encode($token, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+
+http_response_code(200);
+header('Content-Type: text/plain; charset=utf-8');
+echo "authorized\n";

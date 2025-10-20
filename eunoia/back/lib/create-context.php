@@ -91,7 +91,9 @@ function create_context(string $sid, array $client_messages, bool $include_histo
         'content' => '现在时间：' . date('Y-m-dD H:i:s') . "\n" .
                     "今天=" . $today . ' | ' .
                     "明天=" . $tomorrow . ' | ' .
-                    "本周=" . $today . '~' . $week_end . ' | ' .
+                    "本周=" . $today . '~' . $week_end . ' (' . 
+                        implode(', ', array_map(fn($d) => date('m.d', strtotime($today . " +$d days")) . '-周' . ['日','一','二','三','四','五','六'][date('w', strtotime($today . " +$d days"))], range(0, 6))) . 
+                        ') | ' .
                     "下周=" . $next_week_start . '~' . $next_week_end . "\n" .
                     'Calculate dates from THESE values only'
     ];

@@ -126,127 +126,138 @@ function buildClient(array $auth): Client {
 function ymd(\DateTimeInterface $dt): string { return $dt->format('Y-m-d'); }
 function hm(?\DateTimeInterface $dt): ?string { return $dt ? $dt->format('H:i') : null; }
 
-// ---------- main ----------
-$cfg     = loadGoogleCfg();
-$auth    = $cfg['auth_config'];
-$client  = buildClient($auth);
-$service = new Calendar($client);
-$store   = new TaskStore();
+function syncGcal(TaskStore $store): void {
+    $cfg     = loadGoogleCfg();
+    $auth    = $cfg['auth_config'];
+    $client  = buildClient($auth);
+    $service = new Calendar($client);
 
-$nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
-$endUtc = $nowUtc->modify('+' . HORIZON_DAYS . ' days');
+    $nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    $endUtc = $nowUtc->modify('+' . HORIZON_DAYS . ' days');
 
-$params = [
-    'timeMin'      => $nowUtc->format(DATE_RFC3339_EXTENDED),
-    'timeMax'      => $endUtc->format(DATE_RFC3339_EXTENDED),
-    'singleEvents' => true,
-    'orderBy'      => 'startTime',
-    'maxResults'   => 500,
-];
+    $params = [
+        'timeMin'      => $nowUtc->format(DATE_RFC3339_EXTENDED),
+        'timeMax'      => $endUtc->format(DATE_RFC3339_EXTENDED),
+        'singleEvents' => true,
+        'orderBy'      => 'startTime',
+        'maxResults'   => 500,
+    ];
 
-// collect all calendars (primary + shared)
-$targetCals = ['primary', 'MONKEYS_RNEL'];
-$calendars = [];
-$clPage = null;
-do {
-    $list = $service->calendarList->listCalendarList(['pageToken' => $clPage]);
-    foreach ($list->getItems() as $c) {
-        $name = $c->getSummaryOverride() ?: $c->getSummary();
-        if (in_array($name, $targetCals, true) || 
-            (in_array('primary', $targetCals, true) && $c->getPrimary())) {
-            $calendars[] = [
-                'id'   => $c->getId(),
-                'name' => $c->getPrimary() ? 'primary' : $name,
-            ];
+    // collect all calendars (primary + shared)
+    $targetCals = ['primary', 'MONKEYS_RNEL'];
+    $calendars = [];
+    $clPage = null;
+    do {
+        $list = $service->calendarList->listCalendarList(['pageToken' => $clPage]);
+        foreach ($list->getItems() as $c) {
+            $name = $c->getSummaryOverride() ?: $c->getSummary();
+            if (in_array($name, $targetCals, true) || 
+                (in_array('primary', $targetCals, true) && $c->getPrimary())) {
+                $calendars[] = [
+                    'id'   => $c->getId(),
+                    'name' => $c->getPrimary() ? 'primary' : $name,
+                ];
+            }
         }
-    }
-    $clPage = $list->getNextPageToken();
-} while ($clPage);
+        $clPage = $list->getNextPageToken();
+    } while ($clPage);
 
-if (empty($calendars)) {
-    fwrite(STDERR, "Target calendars not found\n");
-    exit(3);
+    if (empty($calendars)) {
+        fwrite(STDERR, "Target calendars not found\n");
+        exit(3);
+    }
+
+    $inserted = 0;
+    $updated = 0;
+    foreach ($calendars as $cal) {
+        $calId = $cal['id'];
+        $calTag = 'gcal:' . preg_replace('/\s+/', '_', strtolower($cal['name']));
+        $pageToken = null;
+
+        do {
+            if ($pageToken) { $params['pageToken'] = $pageToken; } else { unset($params['pageToken']); }
+            $events = $service->events->listEvents($calId, $params);
+
+            foreach ($events->getItems() as $e) {
+                // start
+                $startDt = $e->getStart()->getDateTime();
+                $startTz = $e->getStart()->getTimeZone();
+                if ($startDt) {
+                    $start = $startTz
+                        ? new DateTimeImmutable($startDt, new DateTimeZone($startTz))
+                        : new DateTimeImmutable($startDt);
+                    $isTimedStart = true;
+                } else {
+                    // all-day
+                    $start = new DateTimeImmutable($e->getStart()->getDate() . ' 00:00:00', new DateTimeZone('UTC'));
+                    $isTimedStart = false;
+                }
+
+                // end
+                $endDt = $e->getEnd()->getDateTime();
+                $endTz = $e->getEnd()->getTimeZone();
+                if ($endDt) {
+                    $end = $endTz
+                        ? new DateTimeImmutable($endDt, new DateTimeZone($endTz))
+                        : new DateTimeImmutable($endDt);
+                    $isTimedEnd = true;
+                } else {
+                    $end = $e->getEnd()->getDate()
+                        ? new DateTimeImmutable($e->getEnd()->getDate() . ' 00:00:00', new DateTimeZone('UTC'))
+                        : $start->modify('+1 hour');
+                    $isTimedEnd = false;
+                }
+
+                $time = ['date' => ymd($start)];
+                if ($isTimedStart) { $time['start'] = hm($start); }
+                if ($isTimedEnd)   { $time['end']   = hm($end);   }
+
+                $tags = array_values(array_unique(array_merge(GMAIL_TAGS, [$calTag])));
+
+                $name = trim((string)$e->getSummary());
+                if ($name === '') {
+                    $name = 'Untitled';
+                }
+
+                $task = [
+                    'name'       => $name,
+                    'importance' => DEFAULT_IMPORTANCE,
+                    'tags'       => $tags,
+                    'time'       => $time,
+                    'updates'    => [],
+                ];
+
+                $wasInsert = $store->upsert($task);
+                $wasInsert ? $inserted++ : $updated++;
+            }
+
+            $pageToken = $events->getNextPageToken();
+        } while ($pageToken);
+    };
+
+    echo sprintf(
+        "[%s] Google primary synced: inserted=%d updated=%d horizon=%dd\n",
+        (new DateTimeImmutable('now'))->format('c'),
+        $inserted,
+        $updated,
+        HORIZON_DAYS
+    );
 }
 
-$inserted = 0;
-$updated = 0;
-foreach ($calendars as $cal) {
-    $calId = $cal['id'];
-    $calTag = 'gcal:' . preg_replace('/\s+/', '_', strtolower($cal['name']));
-    $pageToken = null;
-
-    do {
-        if ($pageToken) { $params['pageToken'] = $pageToken; } else { unset($params['pageToken']); }
-        $events = $service->events->listEvents($calId, $params);
-
-        foreach ($events->getItems() as $e) {
-            // start
-            $startDt = $e->getStart()->getDateTime();
-            $startTz = $e->getStart()->getTimeZone();
-            if ($startDt) {
-                $start = $startTz
-                    ? new DateTimeImmutable($startDt, new DateTimeZone($startTz))
-                    : new DateTimeImmutable($startDt);
-                $isTimedStart = true;
-            } else {
-                // all-day
-                $start = new DateTimeImmutable($e->getStart()->getDate() . ' 00:00:00', new DateTimeZone('UTC'));
-                $isTimedStart = false;
-            }
-
-            // end
-            $endDt = $e->getEnd()->getDateTime();
-            $endTz = $e->getEnd()->getTimeZone();
-            if ($endDt) {
-                $end = $endTz
-                    ? new DateTimeImmutable($endDt, new DateTimeZone($endTz))
-                    : new DateTimeImmutable($endDt);
-                $isTimedEnd = true;
-            } else {
-                $end = $e->getEnd()->getDate()
-                    ? new DateTimeImmutable($e->getEnd()->getDate() . ' 00:00:00', new DateTimeZone('UTC'))
-                    : $start->modify('+1 hour');
-                $isTimedEnd = false;
-            }
-
-            $time = ['date' => ymd($start)];
-            if ($isTimedStart) { $time['start'] = hm($start); }
-            if ($isTimedEnd)   { $time['end']   = hm($end);   }
-
-            $tags = array_values(array_unique(array_merge(GMAIL_TAGS, [$calTag])));
-
-            $name = trim((string)$e->getSummary());
-            if ($name === '') {
-                $name = 'Untitled';
-            }
-
-            $task = [
-                'name'       => $name,
-                'importance' => DEFAULT_IMPORTANCE,
-                'tags'       => $tags,
-                'time'       => $time,
-                'updates'    => [],
-            ];
-
-            $wasInsert = $store->upsert($task);
-            $wasInsert ? $inserted++ : $updated++;
-        }
-
-        $pageToken = $events->getNextPageToken();
-    } while ($pageToken);
-};
-
-echo sprintf(
-    "[%s] Google primary synced: inserted=%d updated=%d horizon=%dd\n",
-    (new DateTimeImmutable('now'))->format('c'),
-    $inserted,
-    $updated,
-    HORIZON_DAYS
-);
+// ---------- main ----------
+// gcal
+$store = new TaskStore();
+try {
+    syncGcal($store);
+} catch (Throwable $e) {
+    fwrite(STDERR, "[GCal] " . $e->getMessage() . PHP_EOL);
+}
 
 // now process ICS
 $icsInserted = 0;
 $icsUpdated = 0;
+$nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+$endUtc = $nowUtc->modify('+' . HORIZON_DAYS . ' days');
 
 if (file_exists(ICAL_CFG)) {
     $rawCfg = json_decode((string)file_get_contents(ICAL_CFG), true);
